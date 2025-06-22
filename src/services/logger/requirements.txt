@@ -1,0 +1,3 @@
+# No external dependencies required for this logger service yet
+Flask
+# We'll add them here if needed in the future

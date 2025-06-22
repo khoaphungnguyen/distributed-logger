@@ -1,0 +1,18 @@
+version: '3'
+
+services:
+  # Our simple Python service to test the environment
+  logger:
+    build:
+      context: ./src/services/logger
+    volumes:
+      - ./src/services/logger:/app
+      - ./src/services/logger/logs:/app/logs
+    ports:
+      - "8000:8000"
+      - "8080:8080"
+    environment:
+      - LOG_LEVEL=DEBUG
+      - LOG_FREQUENCY=2
+      - "LOG_FORMAT=[%(asctime)s] %(levelname)s: %(message)s"
+      - LOG_FILE=logs/app.log
