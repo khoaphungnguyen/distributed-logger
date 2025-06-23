@@ -1,18 +1,33 @@
-version: '3'
+version: "3"
 
 services:
   # Our simple Python service to test the environment
-  logger:
+  # logger:
+  #   build:
+  #     context: ./src/services/logger
+  #   volumes:
+  #     - ./src/services/logger:/app
+  #     - ./src/services/logger/logs:/app/logs
+  #   ports:
+  #     - "8000:8000"
+  #     - "8080:8080"
+  #   environment:
+  #     - LOG_LEVEL=DEBUG
+  #     - LOG_FREQUENCY=2
+  #     - "LOG_FORMAT=[%(asctime)s] %(levelname)s: %(message)s"
+  #     - LOG_FILE=logs/app.log
+  log-generator:
     build:
-      context: ./src/services/logger
+      context: ./src/services/log-generator
     volumes:
-      - ./src/services/logger:/app
-      - ./src/services/logger/logs:/app/logs
-    ports:
-      - "8000:8000"
-      - "8080:8080"
+      - ./src/services/log-generator:/app
+      - ./logs:/logs
     environment:
-      - LOG_LEVEL=DEBUG
-      - LOG_FREQUENCY=2
-      - "LOG_FORMAT=[%(asctime)s] %(levelname)s: %(message)s"
-      - LOG_FILE=logs/app.log
+      - LOG_RATE=10
+      - CONSOLE_OUTPUT=true
+      - OUTPUT_FILE=/logs/generated_logs.log
+      - LOG_FORMAT=json
+      - ENABLE_BURSTS=true
+      - BURST_FREQUENCY=0.1
+      - BURST_MULTIPLIER=5
+      - BURST_DURATION=3

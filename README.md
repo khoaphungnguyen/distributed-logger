@@ -75,3 +75,11 @@ You can adjust these values in the `environment:` section of your `docker-compos
 - 🔄 Added log file output with rotation
 - 🌐 Added web interface to view logs and config
 - 🛠 Documented configuration and endpoints
+
+
+ ## Day 2 Milestones
+- ✅ Enhanced log generator with custom fields (e.g., user ID, session token)
+- 🔄 Supported multiple output formats: JSON, CSV, and plain text
+- ⚡ Introduced burst mode to simulate spikes in log activity
+- 🔁 Refined log patterns to reflect realistic event flows and timing
+- 📄 Updated documentation for log schema and usage examples
