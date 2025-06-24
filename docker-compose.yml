@@ -16,16 +16,20 @@ services:
       - BURST_FREQUENCY=0.1
       - BURST_MULTIPLIER=5
       - BURST_DURATION=3
+
   log-collector:
     build:
       context: ./src/services/log-collector
     volumes:
-      - ./logs:/app/logs:ro # Read-only access to logs
+      - ./logs:/app/logs:ro
       - ./collected_logs:/app/collected_logs
     command: >
-      --log-files /app/logs/app.log 
+      --log-files /app/logs/app.log
       --output-dir /app/collected_logs
       --log-format json
-      --filter "ERROR|timeout|failed"
+      --output-type json
+      --filter "ERROR|WARNING"
+    ports:
+      - "5000:5000"
     depends_on:
       - log-generator

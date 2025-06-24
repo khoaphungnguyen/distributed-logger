@@ -64,6 +64,45 @@ You can adjust these values in the `environment:` section of your `docker-compos
 
 ---
 
+---
+
+### 🧪 Sample Output from `/metrics`
+
+Once the log collector is running, you can visit:
+
+```
+http://localhost:5000/metrics
+```
+
+to view real-time log parsing statistics. Example JSON response:
+
+```json
+{
+  "/app/logs/app.log": {
+    "total": 148,
+    "INFO": 117,
+    "ERROR": 24,
+    "tag:auth": 52,
+    "tag:api": 38,
+    "tag:payment": 14,
+    "tag:general": 44,
+    "parsing_errors": 2
+  }
+}
+```
+
+---
+
+### 🌐 What the Web Dashboard Shows
+
+- ✅ **Total log entries collected**
+- 🏷️ **Breakdown by tag** (e.g., `auth`, `api`, `payment`)
+- 🚦 **Breakdown by level** (`INFO`, `ERROR`, etc.)
+- ⚠️ **Parsing error count**
+- 📍 All data is served live via `/metrics` as JSON
+
+---
+
 ## 🚀 Development Milestones
 
 ### Day 1 Milestones
@@ -92,3 +131,12 @@ You can adjust these values in the `environment:` section of your `docker-compos
 - ⚠️ Tracked and reported parsing errors for malformed log lines
 - 💾 Persisted structured collected entries to `collected_logs/collected.jsonl`
 - 🛠 Updated Docker Compose to pass collector configuration via CLI arguments
+
+### Day 4 Milestones
+
+- 🧩 Added support for SQLite and CSV as structured output formats alongside JSON
+- 📊 Implemented real-time statistics tracking for log levels, tags, and total entries
+- ⚠️ Enhanced error handling with live parsing error count
+- 🌐 Integrated a built-in web dashboard (`/metrics`) to display live log stats
+- 🧵 Used background threading to serve metrics without blocking the collector
+- 🛠️ Updated Docker Compose to support `--output-type`, `--filter`, and exposed web port
