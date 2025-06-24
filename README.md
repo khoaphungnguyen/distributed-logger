@@ -64,9 +64,27 @@ You can adjust these values in the `environment:` section of your `docker-compos
 
 ---
 
+### 🧚️ Log Collector
+
+- Watches local log files in real time using `watchdog`
+- Supports batch collection with configurable interval and size
+- Adds semantic tags to logs (e.g., `auth`, `payment`, `api`, `general`)
+- Forwards logs to a central storage endpoint
+- Provides debug logging and tag output when enabled
+
 ---
 
-### 🧪 Sample Output from `/metrics`
+### 🔢 Log Storage Service
+
+- Receives structured logs via `/ingest`
+- Buffers logs in memory and rotates them to compressed `.json.gz` files
+- Auto-prunes older files based on retention settings
+- Exposes live metrics dashboard at `/metrics`
+- Powered by Gunicorn for concurrent request support
+
+---
+
+### 🥯 Sample Output from `/metrics`
 
 Once the log collector is running, you can visit:
 
@@ -74,32 +92,7 @@ Once the log collector is running, you can visit:
 http://localhost:5000/metrics
 ```
 
-to view real-time log parsing statistics. Example JSON response:
-
-```json
-{
-  "/app/logs/app.log": {
-    "total": 148,
-    "INFO": 117,
-    "ERROR": 24,
-    "tag:auth": 52,
-    "tag:api": 38,
-    "tag:payment": 14,
-    "tag:general": 44,
-    "parsing_errors": 2
-  }
-}
-```
-
----
-
-### 🌐 What the Web Dashboard Shows
-
-- ✅ **Total log entries collected**
-- 🏷️ **Breakdown by tag** (e.g., `auth`, `api`, `payment`)
-- 🚦 **Breakdown by level** (`INFO`, `ERROR`, etc.)
-- ⚠️ **Parsing error count**
-- 📍 All data is served live via `/metrics` as JSON
+to view real-time log parsing statistics.
 
 ---
 
@@ -112,7 +105,7 @@ to view real-time log parsing statistics. Example JSON response:
 - Implemented basic logger service
 - 🔄 Added log file output with rotation
 - 🌐 Added web interface to view logs and config
-- 🛠 Documented configuration and endpoints
+- 🚧 Documented configuration and endpoints
 
 ### Day 2 Milestones
 
@@ -124,19 +117,27 @@ to view real-time log parsing statistics. Example JSON response:
 
 ### Day 3 Milestones
 
-- 👁️‍🗨️ Built a real-time log collector using file watchers
+- 👁️ Built a real-time log collector using file watchers
 - 🧠 Supported multiple log formats (JSON and plain text) with dynamic parsing
 - 🔍 Added regex-based filtering for log entry matching
-- 🏷️ Implemented tagging system to categorize entries (e.g., `auth`, `payment`, `api`)
+- 👇 Implemented tagging system to categorize entries (e.g., `auth`, `payment`, `api`)
 - ⚠️ Tracked and reported parsing errors for malformed log lines
 - 💾 Persisted structured collected entries to `collected_logs/collected.jsonl`
-- 🛠 Updated Docker Compose to pass collector configuration via CLI arguments
+- 🚧 Updated Docker Compose to pass collector configuration via CLI arguments
 
 ### Day 4 Milestones
 
-- 🧩 Added support for SQLite and CSV as structured output formats alongside JSON
+- 🧹 Added support for SQLite and CSV as structured output formats alongside JSON
 - 📊 Implemented real-time statistics tracking for log levels, tags, and total entries
 - ⚠️ Enhanced error handling with live parsing error count
 - 🌐 Integrated a built-in web dashboard (`/metrics`) to display live log stats
 - 🧵 Used background threading to serve metrics without blocking the collector
-- 🛠️ Updated Docker Compose to support `--output-type`, `--filter`, and exposed web port
+- 🚧️ Updated Docker Compose to support `--output-type`, `--filter`, and exposed web port
+
+### Day 5 Milestones
+
+- 🔧 Introduced centralized log storage service (`log-storage`)
+- 🔁 Switched to Gunicorn for production-ready performance
+- 📂 Implemented `.json.gz` rotation with disk usage tracking
+- 📊 Improved web dashboard visuals and removed unnecessary charts
+- ⚡ Added real-time ingestion rate per second and source tracking

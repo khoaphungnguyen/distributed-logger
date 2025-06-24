@@ -16,7 +16,6 @@ services:
       - BURST_FREQUENCY=0.1
       - BURST_MULTIPLIER=5
       - BURST_DURATION=3
-
   log-collector:
     build:
       context: ./src/services/log-collector
@@ -25,11 +24,21 @@ services:
       - ./collected_logs:/app/collected_logs
     command: >
       --log-files /app/logs/app.log
-      --output-dir /app/collected_logs
       --log-format json
-      --output-type json
-      --filter "ERROR|WARNING"
-    ports:
-      - "5000:5000"
+      --storage-url http://log-storage:5000/ingest
+      --batch-size 50
+      --batch-interval 5
     depends_on:
       - log-generator
+
+  log-storage:
+    build:
+      context: ./src/services/log-storage
+    volumes:
+      - ./storage_data:/data/storage
+    ports:
+      - "5000:5000"
+    environment:
+      - STORAGE_DIR=/data/storage
+      - MAX_FILE_SIZE=1048576 # 1MB
+      - RETENTION_LIMIT=10

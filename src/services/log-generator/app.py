@@ -1,8 +1,6 @@
 """
 Main application entry point for the log generator service.
 """
-import os
-import time
 import sys
 
 from config import config

@@ -40,7 +40,7 @@ config["LOG_DISTRIBUTION"] = LOG_DISTRIBUTION
 # Add to DEFAULT_CONFIG
 DEFAULT_CONFIG.update({
     "LOG_FORMAT": "text",  # Options: "text", "json", "csv"
-    "SERVICES": ["user-service", "payment-service", "inventory-service", "notification-service"],
+    "SERVICES": ["user-service", "payment-service", "inventory-service", "notification-service", "auth-service"],
     "ENABLE_BURSTS": True,
     "BURST_FREQUENCY": 0.05,  # 5% chance of burst per second
     "BURST_MULTIPLIER": 5,    # 5x normal rate during burst
