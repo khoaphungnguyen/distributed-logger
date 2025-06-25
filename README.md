@@ -28,71 +28,56 @@ We're building a distributed system for processing log data at scale. This repos
 
 ---
 
-## 🔧 Features
+## 🔧 Features (Golang-Based)
 
-### ✅ Logger Service
+### ✅ Go Client
 
-- Logs service heartbeat messages at a configurable frequency
-- Logs are written to **both console and rotating file**
-- Uses Python’s `logging` module with log level and format controls
+- Simulates real-time log generation with random levels, messages, and services
+- Supports configurable **batch size** and **send interval** via CLI flags
+- Can scale multiple clients concurrently using Docker Compose
 
-### ✅ Log Rotation
+### ✅ Go Ingestor (Server)
 
-- Logs are saved to `logs/app.log`
-- When file exceeds **1MB**, it rotates (keeps up to 3 backups)
-
----
-
-## ⚙️ Configuration Options
-
-You can configure the logger via environment variables in `docker-compose.yml`:
-
-| Variable        | Description                             | Default           |
-| --------------- | --------------------------------------- | ----------------- |
-| `LOG_LEVEL`     | Logging level (`DEBUG`, `INFO`, etc.)   | `INFO`            |
-| `LOG_FREQUENCY` | How often logs are emitted (in seconds) | `5`               |
-| `LOG_FORMAT`    | Format string for logs                  | See default below |
-| `LOG_FILE`      | Path to log file                        | `logs/app.log`    |
-
-**Example format string:**
-
-```
-[%(asctime)s] %(levelname)s: %(message)s
-```
-
-You can adjust these values in the `environment:` section of your `docker-compose.yml`.
+- TCP-based ingestion using `net` package for high-throughput log reception
+- Handles each client in a separate goroutine
+- Logs are written to file via buffered writer
+- Tracks and prints real-time **logs/sec** processing rate
+- Supports **log rotation at 5MB** and **gzip compression** upon rotation
+- Buffered channel and writer for asynchronous disk I/O
 
 ---
 
-### 🧚️ Log Collector
+## ⚙️ Configuration Options (Client)
 
-- Watches local log files in real time using `watchdog`
-- Supports batch collection with configurable interval and size
-- Adds semantic tags to logs (e.g., `auth`, `payment`, `api`, `general`)
-- Forwards logs to a central storage endpoint
-- Provides debug logging and tag output when enabled
+You can pass flags to the Go client container to configure batch size and interval:
+
+| Flag         | Description                              | Default |
+| ------------ | ---------------------------------------- | ------- |
+| `--batch`    | Number of logs to send per batch         | `100`   |
+| `--interval` | Interval in milliseconds between batches | `1000`  |
+
+Example:
+
+```yaml
+go-client:
+  command: --batch 500 --interval 10
+```
 
 ---
 
-### 🔢 Log Storage Service
+### 🧪 Sample Ingestor Output
 
-- Receives structured logs via `/ingest`
-- Buffers logs in memory and rotates them to compressed `.json.gz` files
-- Auto-prunes older files based on retention settings
-- Exposes live metrics dashboard at `/metrics`
-- Powered by Gunicorn for concurrent request support
-
----
-
-### 🥯 Sample Output from `/metrics`
-
-Once the log collector is running, you can visit:
+Server prints logs processed per second:
 
 ```
-http://localhost:5000/metrics
+[METRIC] Logs processed: 102345 logs/sec
 ```
 
-to view real-time log parsing statistics.
+Compressed log files are written to:
+
+```
+/app/data/logs_20240622_150000.jsonl.gz
+```
 
 ---
 
@@ -141,3 +126,16 @@ to view real-time log parsing statistics.
 - 📂 Implemented `.json.gz` rotation with disk usage tracking
 - 📊 Improved web dashboard visuals and removed unnecessary charts
 - ⚡ Added real-time ingestion rate per second and source tracking
+
+### Day 6 Milestones
+
+- 🚀 Transitioned to **Golang-based TCP log ingestion** (`go-ingestor`)
+- 🧱 Built high-performance `go-client` log generator with batching support
+- 🔁 Implemented file rotation (5MB max) and Gzip compression upon rollover
+- ⚙️ Enabled batching, configurable interval and batch size via CLI flags
+- 📈 Server logs ingestion rate (logs/second) in real time
+- 🧪 Stress-tested with 2 clients pushing 100,000 logs/sec with no issues
+- 🧵 Used Goroutines for connection scaling, non-blocking write pipeline
+- 🐋 Updated Docker Compose to support multi-client scale testing
+
+The system now supports **true distributed ingestion** over the network with high throughput and scalability using Go.

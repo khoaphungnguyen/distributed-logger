@@ -1,44 +1,22 @@
 version: "3"
 
 services:
-  log-generator:
+  go-ingestor:
     build:
-      context: ./src/services/log-generator
+      context: ./src/services/go-ingestor
     volumes:
-      - ./src/services/log-generator:/app
-      - ./logs:/app/logs
-    environment:
-      - LOG_RATE=10
-      - CONSOLE_OUTPUT=false
-      - OUTPUT_FILE=/app/logs/app.log
-      - LOG_FORMAT=json
-      - ENABLE_BURSTS=true
-      - BURST_FREQUENCY=0.1
-      - BURST_MULTIPLIER=5
-      - BURST_DURATION=3
-  log-collector:
-    build:
-      context: ./src/services/log-collector
-    volumes:
-      - ./logs:/app/logs:ro
-      - ./collected_logs:/app/collected_logs
-    command: >
-      --log-files /app/logs/app.log
-      --log-format json
-      --storage-url http://log-storage:5000/ingest
-      --batch-size 50
-      --batch-interval 5
-    depends_on:
-      - log-generator
-
-  log-storage:
-    build:
-      context: ./src/services/log-storage
-    volumes:
-      - ./storage_data:/data/storage
+      - ./data/:/app/data
     ports:
-      - "5000:5000"
-    environment:
-      - STORAGE_DIR=/data/storage
-      - MAX_FILE_SIZE=1048576 # 1MB
-      - RETENTION_LIMIT=10
+      - "3000:3000"
+  go-client-1:
+    build:
+      context: ./src/services/go-client
+    command: ["./go-client", "--batch", "500", "--interval", "10"]
+    depends_on:
+      - go-ingestor
+  go-client-2:
+    build:
+      context: ./src/services/go-client
+    command: ["./go-client", "--batch", "500", "--interval", "10"]
+    depends_on:
+      - go-ingestor
