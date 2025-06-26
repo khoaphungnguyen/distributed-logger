@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Log Ingestor Dashboard</title>
+  <style>
+    body {
+      font-family: sans-serif;
+      background: #f5f5f5;
+      padding: 2rem;
+    }
+    h1 {
+      text-align: center;
+    }
+    .metric {
+      background: white;
+      padding: 1rem;
+      margin: 1rem auto;
+      max-width: 500px;
+      box-shadow: 0 2px 6px rgba(0,0,0,0.1);
+      border-radius: 8px;
+    }
+    .metric p {
+      font-size: 1.2rem;
+      margin: 0.5rem 0;
+    }
+  </style>
+</head>
+<body>
+  <h1>Log Ingestor Monitoring</h1>
+  <div class="metric">
+    <p><strong>Logs/sec:</strong> <span id="logsPerSec">...</span></p>
+    <p><strong>MB/sec:</strong> <span id="mbPerSec">...</span></p>
+    <p><strong>Latency (µs):</strong> <span id="latencyUs">...</span></p>
+    <p><strong>Queue Length:</strong> <span id="queueLen">...</span></p>
+    <p><strong>File Rotations:</strong> <span id="fileRot">...</span></p>
+    <p><strong>Current File:</strong> <span id="filePath">...</span></p>
+  </div>
+
+  <script>
+    async function fetchMetrics() {
+      try {
+        const res = await fetch('/metrics');
+        const data = await res.json();
+        document.getElementById('logsPerSec').textContent = data.logs_per_sec;
+        document.getElementById('mbPerSec').textContent = data.mb_per_sec.toFixed(2);
+        document.getElementById('latencyUs').textContent = data.latency_us.toFixed(2);
+        document.getElementById('queueLen').textContent = data.queue_length;
+        document.getElementById('fileRot').textContent = data.file_rotations;
+        document.getElementById('filePath').textContent = data.current_file;
+      } catch (err) {
+        console.error('Failed to fetch metrics:', err);
+      }
+    }
+
+    setInterval(fetchMetrics, 1000);
+    fetchMetrics();
+  </script>
+</body>
+</html>

@@ -1,5 +1,3 @@
-version: "3"
-
 services:
   go-ingestor:
     build:
@@ -7,7 +5,7 @@ services:
     volumes:
       - ./data/:/app/data
     ports:
-      - "3000:3000"
+      - "8080:8080"
   go-client-1:
     build:
       context: ./src/services/go-client

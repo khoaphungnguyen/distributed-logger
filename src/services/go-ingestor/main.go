@@ -1,15 +1,17 @@
 // =========================
-// main.go (Go TCP Server)
+// main.go (Go TCP + UDP Server + Web Metrics)
 // =========================
 package main
 
 import (
 	"bufio"
+	"bytes"
 	"compress/gzip"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -26,14 +28,20 @@ type LogEntry struct {
 }
 
 var (
-	logChan      = make(chan LogEntry, 100000)
-	logFile      *os.File
-	gzipWriter   *gzip.Writer
-	mutex        sync.Mutex
-	processCount int
-	rotationSize = int64(5 * 1024 * 1024) // 5MB
-	rateTicker   = time.NewTicker(1 * time.Second)
-	flushLock    sync.Mutex
+	logChan           = make(chan LogEntry, 100000)
+	logFile           *os.File
+	gzipWriter        *gzip.Writer
+	mutex             sync.Mutex
+	processCount      int
+	rotationSize      = int64(5 * 1024 * 1024) // 5MB
+	rateTicker        = time.NewTicker(1 * time.Second)
+	flushLock         sync.Mutex
+	totalBytes        int64
+	totalLatency      int64
+	latencyCount      int64
+	queueLength       int
+	fileRotationCount int
+	lastLogFile       string
 )
 
 func main() {
@@ -42,29 +50,71 @@ func main() {
 
 	go writerWorker()
 	go metricsLogger()
+	go startTCPServer()
+	go startUDPServer()
+	go startHTTPServer()
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-	go func() {
-		<-sigChan
-		log.Println("Shutting down, flushing logs...")
-		close(logChan)
-		os.Exit(0)
-	}()
+	<-sigChan
+	log.Println("Shutting down, flushing logs...")
+	close(logChan)
+}
 
+func startTCPServer() {
 	listener, err := net.Listen("tcp", ":3000")
 	if err != nil {
-		log.Fatalf("Failed to listen on port 3000: %v", err)
+		log.Fatalf("Failed to listen on TCP port 3000: %v", err)
 	}
 	log.Println("TCP log ingestor listening on :3000")
 
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			log.Printf("Accept error: %v", err)
+			log.Printf("TCP Accept error: %v", err)
 			continue
 		}
 		go handleConnection(conn)
+	}
+}
+
+func startUDPServer() {
+	addr, err := net.ResolveUDPAddr("udp", ":3001")
+	if err != nil {
+		log.Fatalf("Failed to resolve UDP port: %v", err)
+	}
+	conn, err := net.ListenUDP("udp", addr)
+	if err != nil {
+		log.Fatalf("Failed to listen on UDP port 3001: %v", err)
+	}
+	log.Println("UDP log ingestor listening on :3001")
+
+	buf := make([]byte, 65535)
+	for {
+		n, _, err := conn.ReadFromUDP(buf)
+		if err != nil {
+			log.Printf("UDP read error: %v", err)
+			continue
+		}
+
+		scanner := bufio.NewScanner(bytes.NewReader(buf[:n]))
+		for scanner.Scan() {
+			start := time.Now()
+			var entry LogEntry
+			line := scanner.Bytes()
+			if err := json.Unmarshal(line, &entry); err != nil {
+				log.Printf("Invalid UDP log format: %v", err)
+				continue
+			}
+			if entry.Timestamp == "" {
+				entry.Timestamp = time.Now().UTC().Format(time.RFC3339)
+			}
+			logChan <- entry
+			recordLatency(time.Since(start))
+		}
+		if err := scanner.Err(); err != nil {
+			log.Printf("UDP scanner error: %v", err)
+		}
 	}
 }
 
@@ -72,19 +122,21 @@ func handleConnection(conn net.Conn) {
 	defer conn.Close()
 	scanner := bufio.NewScanner(conn)
 	for scanner.Scan() {
+		start := time.Now()
 		var entry LogEntry
 		line := scanner.Bytes()
 		if err := json.Unmarshal(line, &entry); err != nil {
-			log.Printf("Invalid log format: %v", err)
+			log.Printf("Invalid TCP log format: %v", err)
 			continue
 		}
 		if entry.Timestamp == "" {
 			entry.Timestamp = time.Now().UTC().Format(time.RFC3339)
 		}
 		logChan <- entry
+		recordLatency(time.Since(start))
 	}
 	if err := scanner.Err(); err != nil {
-		log.Printf("Scanner error: %v", err)
+		log.Printf("TCP scanner error: %v", err)
 	}
 }
 
@@ -102,6 +154,7 @@ func writerWorker() {
 			buffer = append(buffer, entry)
 			mutex.Lock()
 			processCount++
+			queueLength = len(logChan)
 			mutex.Unlock()
 
 			if len(buffer) >= 1000 || shouldRotate() {
@@ -125,6 +178,7 @@ func flushLogs(logs []LogEntry) {
 	for _, entry := range logs {
 		line, _ := json.Marshal(entry)
 		gzipWriter.Write([]byte(string(line) + "\n"))
+		totalBytes += int64(len(line)) + 1
 	}
 	gzipWriter.Flush()
 }
@@ -145,7 +199,6 @@ func rotateIfNeeded() {
 
 func rotateLogFile() {
 	closeLogFile()
-
 	timestamp := time.Now().Format("20060102_150405")
 	filePath := filepath.Join("./data", fmt.Sprintf("log_%s.jsonl.gz", timestamp))
 	f, err := os.Create(filePath)
@@ -154,6 +207,8 @@ func rotateLogFile() {
 	}
 	logFile = f
 	gzipWriter = gzip.NewWriter(logFile)
+	lastLogFile = filePath
+	fileRotationCount++
 	log.Printf("Started new log file: %s", filePath)
 }
 
@@ -170,8 +225,46 @@ func metricsLogger() {
 	for range rateTicker.C {
 		mutex.Lock()
 		rate := processCount
+		bytesPerSec := totalBytes
+		avgLatency := float64(0)
+		if latencyCount > 0 {
+			avgLatency = float64(totalLatency) / float64(latencyCount)
+		}
+		queueLen := queueLength
+		rotations := fileRotationCount
+		lastFile := lastLogFile
+
 		processCount = 0
+		totalBytes = 0
+		totalLatency = 0
+		latencyCount = 0
 		mutex.Unlock()
-		log.Printf("[METRIC] Logs processed: %d logs/sec", rate)
+
+		log.Printf("[METRIC] Logs/sec: %d, MB/s: %.2f, Latency: %.2fµs, Queue: %d, Rotations: %d, File: %s",
+			rate, float64(bytesPerSec)/(1024*1024), avgLatency, queueLen, rotations, lastFile)
 	}
+}
+
+func recordLatency(d time.Duration) {
+	mutex.Lock()
+	totalLatency += d.Microseconds()
+	latencyCount++
+	mutex.Unlock()
+}
+
+func startHTTPServer() {
+	http.Handle("/", http.FileServer(http.Dir("./static")))
+	http.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+		mutex.Lock()
+		defer mutex.Unlock()
+		fmt.Fprintf(w, `{"logs_per_sec": %d, "mb_per_sec": %.2f, "latency_us": %.2f, "queue_length": %d, "file_rotations": %d, "current_file": "%s"}`,
+			processCount,
+			float64(totalBytes)/(1024*1024),
+			float64(totalLatency)/float64(latencyCount),
+			queueLength,
+			fileRotationCount,
+			lastLogFile)
+	})
+	log.Println("Metrics available at http://localhost:8080/metrics")
+	http.ListenAndServe(":8080", nil)
 }

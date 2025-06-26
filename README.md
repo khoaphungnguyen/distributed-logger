@@ -138,4 +138,18 @@ Compressed log files are written to:
 - 🧵 Used Goroutines for connection scaling, non-blocking write pipeline
 - 🐋 Updated Docker Compose to support multi-client scale testing
 
-The system now supports **true distributed ingestion** over the network with high throughput and scalability using Go.
+### Day 7 Milestones
+
+* 📡 **Added UDP ingestion support** alongside existing TCP server in `go-ingestor`
+* 🔀 **Dual protocol support** (TCP/UDP) running on ports `3000` and `3001`
+* ⚖️ Used **Goroutines** and **separate handlers** to process UDP packets efficiently
+* 🧪 Validated ingestion consistency with `go-client` supporting `--udp` flag
+* 📊 **Enhanced monitoring dashboard** (`/dashboard`) with:
+  * Logs/sec
+  * MB/sec throughput
+  * Avg latency (µs)
+  * Queue length
+  * File rotation count
+  * Recent error messages
+* 💾 Observed Gzip compression saving **\~95%+ storage** on log files
+* 🔍 Simulated realistic log generation: 5% ERROR, 10% WARN, 85% INFO/DEBUG

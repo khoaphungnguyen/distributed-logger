@@ -1,3 +1,6 @@
+// =========================
+// main.go (Go Log Client TCP + UDP)
+// =========================
 package main
 
 import (
@@ -48,16 +51,27 @@ func main() {
 	// Define command-line flags
 	batchSize := flag.Int("batch", 100, "Number of logs per batch")
 	intervalMs := flag.Int("interval", 100, "Interval in milliseconds between batches")
+	useUDP := flag.Bool("udp", false, "Use UDP instead of TCP")
 	flag.Parse()
 
-	conn, err := net.Dial("tcp", "go-ingestor:3000")
+	var conn net.Conn
+	var err error
+	if *useUDP {
+		conn, err = net.Dial("udp", "go-ingestor:3001")
+	} else {
+		conn, err = net.Dial("tcp", "go-ingestor:3000")
+	}
 	if err != nil {
 		fmt.Println("Failed to connect to ingestor:", err)
 		os.Exit(1)
 	}
 	defer conn.Close()
 
-	fmt.Printf("Connected to go-ingestor. Sending %d logs every %dms...\n", *batchSize, *intervalMs)
+	protocol := "TCP"
+	if *useUDP {
+		protocol = "UDP"
+	}
+	fmt.Printf("Connected to go-ingestor via %s. Sending %d logs every %dms...\n", protocol, *batchSize, *intervalMs)
 
 	ticker := time.NewTicker(time.Duration(*intervalMs) * time.Millisecond)
 	defer ticker.Stop()
