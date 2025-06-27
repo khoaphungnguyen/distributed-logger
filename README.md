@@ -16,7 +16,8 @@ We're building a distributed system for processing log data at scale. This repos
 
 1. Clone this repository
 2. Navigate to the project directory
-3. Run `docker-compose up --build`
+3. Run `docker-compose up --build` to 
+4. Run `docker-compose up --build`  to clean up re
 
 ## Project Structure
 
@@ -33,50 +34,74 @@ We're building a distributed system for processing log data at scale. This repos
 ### ✅ Go Client
 
 - Simulates real-time log generation with random levels, messages, and services
-- Supports configurable **batch size** and **send interval** via CLI flags
-- Can scale multiple clients concurrently using Docker Compose
+- Supports configurable **batch size**, **send interval**, **address**, and **protocol** (TCP/UDP) via CLI flags
+- **Graceful shutdown**: Handles SIGINT/SIGTERM for safe exit and resource cleanup
+- **UDP batch splitting**: Automatically splits large batches to avoid exceeding safe MTU (1400 bytes)
+- **UDP batch size warning**: Warns if any UDP chunk exceeds safe MTU
+- **Retry mechanism**: Retries failed batch transmissions up to 3 times
+- **Enhanced metrics**: Tracks and logs sent/failed batch counts, with periodic stats output
+- **Improved error handling**: Handles JSON marshal errors and connection issues robustly
+- **TLS encryption**: Uses TLS for secure TCP log transmission
 
-### ✅ Go Ingestor (Server)
+## ✅ Go Ingestor (Server)
 
-- TCP-based ingestion using `net` package for high-throughput log reception
+- **TLS-encrypted TCP ingestion** for secure log reception
+- **UDP ingestion** for high-throughput, lossy log reception
 - Handles each client in a separate goroutine
 - Logs are written to file via buffered writer
-- Tracks and prints real-time **logs/sec** processing rate
+- Tracks and prints real-time **logs/sec**, **MB/sec**, **latency**, **queue length**, and **file rotations**
 - Supports **log rotation at 5MB** and **gzip compression** upon rotation
 - Buffered channel and writer for asynchronous disk I/O
+- Built-in web dashboard (`/`) and `/metrics` endpoint for live stats
 
 ---
 
 ## ⚙️ Configuration Options (Client)
 
-You can pass flags to the Go client container to configure batch size and interval:
+You can pass flags to the Go client container to configure its behavior:
 
-| Flag         | Description                              | Default |
-| ------------ | ---------------------------------------- | ------- |
-| `--batch`    | Number of logs to send per batch         | `100`   |
-| `--interval` | Interval in milliseconds between batches | `1000`  |
+| Flag           | Description                              | Default      |
+| -------------- | ---------------------------------------- | ------------ |
+| `--batch`      | Number of logs to send per batch         | `100`        |
+| `--interval`   | Interval in milliseconds between batches | `1000`       |
+| `--address`    | Ingestor host address                    | `go-ingestor`|
+| `--tcp-port`   | TCP port for ingestion                   | `3000`       |
+| `--udp-port`   | UDP port for ingestion                   | `3001`       |
+| `--udp`        | Use UDP instead of TCP                   | `false`      |
 
 Example:
 
 ```yaml
 go-client:
-  command: --batch 500 --interval 10
+  command: --batch 500 --interval 10 --address go-ingestor --tcp-port 3000 --udp-port 3001 --udp
 ```
+
+---
+
+## 🔒 Generating TLS Certificates
+
+To enable TLS for secure TCP log transmission, generate self-signed certificates (for testing):
+
+```sh
+openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -nodes -subj "/CN=localhost"
+```
+
+Place `cert.pem` and `key.pem` in the appropriate directory (e.g., `src/services/go-ingestor/certs/`).
 
 ---
 
 ### 🧪 Sample Ingestor Output
 
-Server prints logs processed per second:
+Server prints logs processed per second and other metrics:
 
 ```
-[METRIC] Logs processed: 102345 logs/sec
+go-ingestor_1  | 2025/06/27 16:54:59 [METRIC] Logs/sec: 100001, MB/s: 9.78, Latency: 1.21µs, Queue: 19, Rotations: 2
 ```
 
 Compressed log files are written to:
 
 ```
-/app/data/logs_20240622_150000.jsonl.gz
+/app/data/log_20250627_165447.jsonl.gz
 ```
 
 ---
@@ -129,7 +154,7 @@ Compressed log files are written to:
 
 ### Day 6 Milestones
 
-- 🚀 Transitioned to **Golang-based TCP log ingestion** (`go-ingestor`)
+- - 🚀 Transitioned to **Golang-based TCP log ingestion** (`go-ingestor`), replacing the original Flask-based ingestor, which could only handle around 150 messages per connection before significant slowdowns.
 - 🧱 Built high-performance `go-client` log generator with batching support
 - 🔁 Implemented file rotation (5MB max) and Gzip compression upon rollover
 - ⚙️ Enabled batching, configurable interval and batch size via CLI flags
@@ -162,3 +187,10 @@ Compressed log files are written to:
 - 📈 **Enhanced metrics**: Tracks and logs sent/failed batch counts, with periodic stats output
 - 🧹 **Improved error handling**: Handles JSON marshal errors and connection issues robustly
 - 🔄 **Retry mechanism**: Retries failed batch transmissions up to 3 times for reliability
+
+### Day 9 Milestones
+
+- 🔒 **TLS encryption for TCP**: All TCP log traffic is now encrypted using TLS certificates
+- 📦 **UDP batch splitting**: Client splits UDP batches to avoid exceeding 1400 bytes (safe MTU)
+- 🛡️ **Production-ready ingestion**: Secure, reliable log delivery over TCP; UDP supported for high-throughput, lossy scenarios
+- 🧪 **Validated secure ingestion**: Confirmed end-to-end encrypted log flow and UDP chunking in multi-client tests

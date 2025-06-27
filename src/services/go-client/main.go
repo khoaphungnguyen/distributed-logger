@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"flag"
 	"log"
@@ -81,7 +82,10 @@ func main() {
 		conn, err = net.Dial("udp", addr)
 	} else {
 		addr = *address + ":" + *tcpPort
-		conn, err = net.Dial("tcp", addr)
+		tlsConfig := &tls.Config{
+			InsecureSkipVerify: true, // For self-signed certs in testing; set to false and use RootCAs in production!
+		}
+		conn, err = tls.Dial("tcp", addr, tlsConfig)
 	}
 	if err != nil {
 		log.Fatalf("Failed to connect to ingestor: %v", err)
@@ -117,27 +121,60 @@ loop:
 				}
 				batch = append(batch, string(b))
 			}
-			batchData := strings.Join(batch, "\n") + "\n"
 
-			// UDP batch size warning
-			if *useUDP && len(batchData) > 1400 {
-				log.Printf("Warning: UDP batch size (%d bytes) may exceed safe MTU, consider reducing batch size.", len(batchData))
-			}
-
-			err := sendWithRetry(conn, []byte(batchData), 3)
-			if err != nil {
-				log.Printf("Failed to send batch after retries: %v", err)
-				failedBatches++
+			if *useUDP {
+				const maxUDPPacket = 1400
+				chunks := splitBatchForUDP(batch, maxUDPPacket)
+				for i, chunk := range chunks {
+					chunkData := strings.Join(chunk, "\n") + "\n"
+					if len(chunkData) > maxUDPPacket {
+						log.Printf("Warning: UDP chunk %d size (%d bytes) exceeds safe MTU", i, len(chunkData))
+					}
+					err := sendWithRetry(conn, []byte(chunkData), 3)
+					if err != nil {
+						log.Printf("Failed to send UDP chunk %d after retries: %v", i, err)
+						failedBatches++
+					} else {
+						sentBatches++
+					}
+				}
 			} else {
-				sentBatches++
+				batchData := strings.Join(batch, "\n") + "\n"
+				err := sendWithRetry(conn, []byte(batchData), 3)
+				if err != nil {
+					log.Printf("Failed to send batch after retries: %v", err)
+					failedBatches++
+				} else {
+					sentBatches++
+				}
 			}
 
-			// Print stats every 1000 batches
-			if (sentBatches+failedBatches)%1000 == 0 {
-				log.Printf("Stats: Sent batches: %d, Failed batches: %d", sentBatches, failedBatches)
-				log.Println("Batch Size Len:", len(batchData))
-			}
 		}
 	}
 	log.Printf("Final stats: Sent batches: %d, Failed batches: %d", sentBatches, failedBatches)
+}
+
+// Split batch into slices of strings, each joined chunk <= maxBytes
+func splitBatchForUDP(batch []string, maxBytes int) [][]string {
+	var result [][]string
+	var current []string
+	currentLen := 0
+
+	for _, entry := range batch {
+		entryLen := len(entry) + 1 // +1 for newline
+		if currentLen+entryLen > maxBytes {
+			if len(current) > 0 {
+				result = append(result, current)
+			}
+			current = []string{entry}
+			currentLen = entryLen
+		} else {
+			current = append(current, entry)
+			currentLen += entryLen
+		}
+	}
+	if len(current) > 0 {
+		result = append(result, current)
+	}
+	return result
 }

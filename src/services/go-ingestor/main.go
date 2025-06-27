@@ -7,6 +7,7 @@ import (
 	"bufio"
 	"bytes"
 	"compress/gzip"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -41,7 +42,6 @@ var (
 	latencyCount      int64
 	queueLength       int
 	fileRotationCount int
-	lastLogFile       string
 )
 
 func main() {
@@ -62,11 +62,17 @@ func main() {
 }
 
 func startTCPServer() {
-	listener, err := net.Listen("tcp", ":3000")
+	cert, err := tls.LoadX509KeyPair("./certs/cert.pem", "./certs/key.pem")
+	if err != nil {
+		log.Fatalf("Failed to load TLS certs: %v", err)
+	}
+	config := &tls.Config{Certificates: []tls.Certificate{cert}}
+
+	listener, err := tls.Listen("tcp", ":3000", config)
 	if err != nil {
 		log.Fatalf("Failed to listen on TCP port 3000: %v", err)
 	}
-	log.Println("TCP log ingestor listening on :3000")
+	log.Println("TLS TCP log ingestor listening on :3000")
 
 	for {
 		conn, err := listener.Accept()
@@ -207,7 +213,6 @@ func rotateLogFile() {
 	}
 	logFile = f
 	gzipWriter = gzip.NewWriter(logFile)
-	lastLogFile = filePath
 	fileRotationCount++
 	log.Printf("Started new log file: %s", filePath)
 }
@@ -232,7 +237,6 @@ func metricsLogger() {
 		}
 		queueLen := queueLength
 		rotations := fileRotationCount
-		lastFile := lastLogFile
 
 		processCount = 0
 		totalBytes = 0
@@ -240,11 +244,10 @@ func metricsLogger() {
 		latencyCount = 0
 		mutex.Unlock()
 
-		log.Printf("[METRIC] Logs/sec: %d, MB/s: %.2f, Latency: %.2fµs, Queue: %d, Rotations: %d, File: %s",
-			rate, float64(bytesPerSec)/(1024*1024), avgLatency, queueLen, rotations, lastFile)
+		log.Printf("[METRIC] Logs/sec: %d, MB/s: %.2f, Latency: %.2fµs, Queue: %d, Rotations: %d",
+			rate, float64(bytesPerSec)/(1024*1024), avgLatency, queueLen, rotations)
 	}
 }
-
 func recordLatency(d time.Duration) {
 	mutex.Lock()
 	totalLatency += d.Microseconds()
@@ -257,13 +260,12 @@ func startHTTPServer() {
 	http.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
 		mutex.Lock()
 		defer mutex.Unlock()
-		fmt.Fprintf(w, `{"logs_per_sec": %d, "mb_per_sec": %.2f, "latency_us": %.2f, "queue_length": %d, "file_rotations": %d, "current_file": "%s"}`,
+		fmt.Fprintf(w, `{"logs_per_sec": %d, "mb_per_sec": %.2f, "latency_us": %.2f, "queue_length": %d, "file_rotations": %d}`,
 			processCount,
 			float64(totalBytes)/(1024*1024),
 			float64(totalLatency)/float64(latencyCount),
 			queueLength,
-			fileRotationCount,
-			lastLogFile)
+			fileRotationCount)
 	})
 	log.Println("Metrics available at http://localhost:8080/metrics")
 	http.ListenAndServe(":8080", nil)
