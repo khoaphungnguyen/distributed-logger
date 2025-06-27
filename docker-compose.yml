@@ -15,6 +15,6 @@ services:
   go-client-2:
     build:
       context: ./src/services/go-client
-    command: ["./go-client", "--batch", "500", "--interval", "10"]
+    command: ["./go-client", "--batch", "500", "--interval", "10", "--udp"]
     depends_on:
       - go-ingestor

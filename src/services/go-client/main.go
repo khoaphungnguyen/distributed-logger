@@ -1,16 +1,15 @@
-// =========================
-// main.go (Go Log Client TCP + UDP)
-// =========================
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
-	"fmt"
+	"log"
 	"math/rand"
 	"net"
-	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -45,25 +44,47 @@ func randomLog() LogEntry {
 	}
 }
 
+func sendWithRetry(conn net.Conn, data []byte, maxRetries int) error {
+	var err error
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		_, err = conn.Write(data)
+		if err == nil {
+			return nil
+		}
+		log.Printf("Send failed (attempt %d/%d): %v", attempt, maxRetries, err)
+		time.Sleep(200 * time.Millisecond)
+	}
+	return err
+}
+
 func main() {
 	rand.Seed(time.Now().UnixNano())
 
-	// Define command-line flags
+	// Configurable address and port
+	address := flag.String("address", "go-ingestor", "Ingestor host address")
+	tcpPort := flag.String("tcp-port", "3000", "TCP port")
+	udpPort := flag.String("udp-port", "3001", "UDP port")
 	batchSize := flag.Int("batch", 100, "Number of logs per batch")
 	intervalMs := flag.Int("interval", 100, "Interval in milliseconds between batches")
 	useUDP := flag.Bool("udp", false, "Use UDP instead of TCP")
 	flag.Parse()
 
+	// Graceful shutdown
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
 	var conn net.Conn
 	var err error
+	var addr string
 	if *useUDP {
-		conn, err = net.Dial("udp", "go-ingestor:3001")
+		addr = *address + ":" + *udpPort
+		conn, err = net.Dial("udp", addr)
 	} else {
-		conn, err = net.Dial("tcp", "go-ingestor:3000")
+		addr = *address + ":" + *tcpPort
+		conn, err = net.Dial("tcp", addr)
 	}
 	if err != nil {
-		fmt.Println("Failed to connect to ingestor:", err)
-		os.Exit(1)
+		log.Fatalf("Failed to connect to ingestor: %v", err)
 	}
 	defer conn.Close()
 
@@ -71,19 +92,52 @@ func main() {
 	if *useUDP {
 		protocol = "UDP"
 	}
-	fmt.Printf("Connected to go-ingestor via %s. Sending %d logs every %dms...\n", protocol, *batchSize, *intervalMs)
+	log.Printf("Connected to %s via %s. Sending %d logs every %dms...", addr, protocol, *batchSize, *intervalMs)
 
 	ticker := time.NewTicker(time.Duration(*intervalMs) * time.Millisecond)
 	defer ticker.Stop()
 
-	for range ticker.C {
-		var batch []string
-		for i := 0; i < *batchSize; i++ {
-			entry := randomLog()
-			b, _ := json.Marshal(entry)
-			batch = append(batch, string(b))
+	// Metrics
+	var sentBatches, failedBatches int
+
+loop:
+	for {
+		select {
+		case <-ctx.Done():
+			log.Println("Received shutdown signal, exiting...")
+			break loop
+		case <-ticker.C:
+			var batch []string
+			for i := 0; i < *batchSize; i++ {
+				entry := randomLog()
+				b, err := json.Marshal(entry)
+				if err != nil {
+					log.Printf("Failed to marshal log entry: %v", err)
+					continue
+				}
+				batch = append(batch, string(b))
+			}
+			batchData := strings.Join(batch, "\n") + "\n"
+
+			// UDP batch size warning
+			if *useUDP && len(batchData) > 1400 {
+				log.Printf("Warning: UDP batch size (%d bytes) may exceed safe MTU, consider reducing batch size.", len(batchData))
+			}
+
+			err := sendWithRetry(conn, []byte(batchData), 3)
+			if err != nil {
+				log.Printf("Failed to send batch after retries: %v", err)
+				failedBatches++
+			} else {
+				sentBatches++
+			}
+
+			// Print stats every 1000 batches
+			if (sentBatches+failedBatches)%1000 == 0 {
+				log.Printf("Stats: Sent batches: %d, Failed batches: %d", sentBatches, failedBatches)
+				log.Println("Batch Size Len:", len(batchData))
+			}
 		}
-		batchData := strings.Join(batch, "\n") + "\n"
-		conn.Write([]byte(batchData))
 	}
+	log.Printf("Final stats: Sent batches: %d, Failed batches: %d", sentBatches, failedBatches)
 }

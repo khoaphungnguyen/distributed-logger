@@ -140,16 +140,25 @@ Compressed log files are written to:
 
 ### Day 7 Milestones
 
-* 📡 **Added UDP ingestion support** alongside existing TCP server in `go-ingestor`
-* 🔀 **Dual protocol support** (TCP/UDP) running on ports `3000` and `3001`
-* ⚖️ Used **Goroutines** and **separate handlers** to process UDP packets efficiently
-* 🧪 Validated ingestion consistency with `go-client` supporting `--udp` flag
-* 📊 **Enhanced monitoring dashboard** (`/dashboard`) with:
-  * Logs/sec
-  * MB/sec throughput
-  * Avg latency (µs)
-  * Queue length
-  * File rotation count
-  * Recent error messages
-* 💾 Observed Gzip compression saving **\~95%+ storage** on log files
-* 🔍 Simulated realistic log generation: 5% ERROR, 10% WARN, 85% INFO/DEBUG
+- 📡 **Added UDP ingestion support** alongside existing TCP server in `go-ingestor`
+- 🔀 **Dual protocol support** (TCP/UDP) running on ports `3000` and `3001`
+- ⚖️ Used **Goroutines** and **separate handlers** to process UDP packets efficiently
+- 🧪 Validated ingestion consistency with `go-client` supporting `--udp` flag
+- 📊 **Enhanced monitoring dashboard** (`/dashboard`) with:
+  - Logs/sec
+  - MB/sec throughput
+  - Avg latency (µs)
+  - Queue length
+  - File rotation count
+  - Recent error messages
+- 💾 Observed Gzip compression saving **\~95%+ storage** on log files
+- 🔍 Simulated realistic log generation: 5% ERROR, 10% WARN, 85% INFO/DEBUG
+
+### Day 8 Milestones
+
+- 🛡️ **Graceful shutdown**: Client now handles SIGINT/SIGTERM for safe exit and resource cleanup
+- ⚙️ **Configurable address and port**: Easily set ingestor host and port via CLI flags (`--address`, `--tcp-port`, `--udp-port`)
+- 📏 **UDP batch size warning**: Client warns if UDP batch exceeds safe MTU (1400 bytes) to prevent packet loss
+- 📈 **Enhanced metrics**: Tracks and logs sent/failed batch counts, with periodic stats output
+- 🧹 **Improved error handling**: Handles JSON marshal errors and connection issues robustly
+- 🔄 **Retry mechanism**: Retries failed batch transmissions up to 3 times for reliability
