@@ -6,7 +6,10 @@ package main
 import (
 	"bufio"
 	"bytes"
-	"compress/gzip"
+	"hash/crc32"
+	"sync/atomic"
+
+	// "compress/gzip" // REMOVE this line
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
@@ -16,9 +19,12 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/klauspost/compress/zstd" // ADD this line
 )
 
 type LogEntry struct {
@@ -28,27 +34,37 @@ type LogEntry struct {
 	Service   string `json:"service"`
 }
 
+const numWriters = 12
+
+var logChans [numWriters]chan LogEntry
+
+// Each writer has its own file and zstd writer
+var logFiles [numWriters]*os.File
+var zstdWriters [numWriters]*zstd.Encoder
+var writerLocks [numWriters]sync.Mutex
+
 var (
-	logChan           = make(chan LogEntry, 100000)
-	logFile           *os.File
-	gzipWriter        *gzip.Writer
+	logFile *os.File
+	// gzipWriter        *gzip.Writer // REMOVE this line
 	mutex             sync.Mutex
-	processCount      int
-	rotationSize      = int64(5 * 1024 * 1024) // 5MB
+	processCount      int64
+	rotationSize      = int64(50 * 1024 * 1024) // 50MB
 	rateTicker        = time.NewTicker(1 * time.Second)
-	flushLock         sync.Mutex
 	totalBytes        int64
 	totalLatency      int64
 	latencyCount      int64
-	queueLength       int
-	fileRotationCount int
+	queueLength       int64
+	fileRotationCount int32
+	maxQueueLength    int64
+	droppedLogs       int64
 )
 
 func main() {
-	rotateLogFile()
-	defer closeLogFile()
-
-	go writerWorker()
+	setupFile()
+	for i := 0; i < numWriters; i++ {
+		logChans[i] = make(chan LogEntry, 100000)
+		go writerWorker(i)
+	}
 	go metricsLogger()
 	go startTCPServer()
 	go startUDPServer()
@@ -58,7 +74,20 @@ func main() {
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 	<-sigChan
 	log.Println("Shutting down, flushing logs...")
-	close(logChan)
+	for i := 0; i < numWriters; i++ {
+		close(logChans[i])
+	}
+	for i := 0; i < numWriters; i++ {
+		closeLogFile(i)
+	}
+}
+
+func setupFile() {
+	dataDir := "./data"
+	err := os.MkdirAll(dataDir, 0755)
+	if err != nil {
+		log.Fatalf("Failed to create data directory: %v", err)
+	}
 }
 
 func startTCPServer() {
@@ -115,7 +144,7 @@ func startUDPServer() {
 			if entry.Timestamp == "" {
 				entry.Timestamp = time.Now().UTC().Format(time.RFC3339)
 			}
-			logChan <- entry
+			enqueueLog(entry)
 			recordLatency(time.Since(start))
 		}
 		if err := scanner.Err(); err != nil {
@@ -138,7 +167,7 @@ func handleConnection(conn net.Conn) {
 		if entry.Timestamp == "" {
 			entry.Timestamp = time.Now().UTC().Format(time.RFC3339)
 		}
-		logChan <- entry
+		enqueueLog(entry)
 		recordLatency(time.Since(start))
 	}
 	if err := scanner.Err(); err != nil {
@@ -146,126 +175,179 @@ func handleConnection(conn net.Conn) {
 	}
 }
 
-func writerWorker() {
-	buffer := make([]LogEntry, 0, 1000)
-	flushTimer := time.NewTicker(5 * time.Second)
+// Hash function to distribute logs
+func hash(entry LogEntry) int {
+	return int(crc32.ChecksumIEEE([]byte(entry.Timestamp+entry.Service))) % numWriters
+}
+
+func enqueueLog(entry LogEntry) {
+	idx := hash(entry)
+	select {
+	case logChans[idx] <- entry:
+		// enqueued
+	default:
+		atomic.AddInt64(&droppedLogs, 1)
+		if atomic.AddInt64(&droppedLogs, 1)%1000 == 0 {
+			log.Printf("[OVERLOAD] Log dropped! Total dropped: %d", atomic.LoadInt64(&droppedLogs))
+		}
+	}
+}
+
+func writerWorker(idx int) {
+	rotateLogFile(idx)
+	buffer := make([]LogEntry, 0, 100000)
+	flushTimer := time.NewTicker(1000 * time.Millisecond)
+	defer flushTimer.Stop()
 
 	for {
 		select {
-		case entry, ok := <-logChan:
+		case entry, ok := <-logChans[idx]:
 			if !ok {
-				flushLogs(buffer)
+				flushLogs(idx, buffer)
 				return
 			}
 			buffer = append(buffer, entry)
-			mutex.Lock()
-			processCount++
-			queueLength = len(logChan)
-			mutex.Unlock()
-
-			if len(buffer) >= 1000 || shouldRotate() {
-				flushLogs(buffer)
+			atomic.AddInt64(&processCount, 1)
+			atomic.StoreInt64(&queueLength, int64(len(logChans[idx])))
+			if len(buffer) >= 20000 || shouldRotate(idx) {
+				flushLogs(idx, buffer)
 				buffer = buffer[:0]
 			}
 		case <-flushTimer.C:
 			if len(buffer) > 0 {
-				flushLogs(buffer)
+				flushLogs(idx, buffer)
 				buffer = buffer[:0]
 			}
 		}
 	}
 }
 
-func flushLogs(logs []LogEntry) {
-	flushLock.Lock()
-	defer flushLock.Unlock()
-
-	rotateIfNeeded()
+func flushLogs(idx int, logs []LogEntry) {
+	writerLocks[idx].Lock()
+	defer writerLocks[idx].Unlock()
+	rotateIfNeeded(idx)
 	for _, entry := range logs {
 		line, _ := json.Marshal(entry)
-		gzipWriter.Write([]byte(string(line) + "\n"))
-		totalBytes += int64(len(line)) + 1
+		zstdWriters[idx].Write([]byte(string(line) + "\n"))
+		atomic.AddInt64(&totalBytes, int64(len(line)+1))
 	}
-	gzipWriter.Flush()
+	zstdWriters[idx].Flush()
 }
 
-func shouldRotate() bool {
-	if logFile == nil {
+func shouldRotate(idx int) bool {
+	if logFiles[idx] == nil {
 		return true
 	}
-	info, err := logFile.Stat()
+	info, err := logFiles[idx].Stat()
 	return err != nil || info.Size() >= rotationSize
 }
 
-func rotateIfNeeded() {
-	if shouldRotate() {
-		rotateLogFile()
+func rotateIfNeeded(idx int) {
+	if shouldRotate(idx) {
+		rotateLogFile(idx)
 	}
 }
 
-func rotateLogFile() {
-	closeLogFile()
+func rotateLogFile(idx int) {
+	closeLogFile(idx)
 	timestamp := time.Now().Format("20060102_150405")
-	filePath := filepath.Join("./data", fmt.Sprintf("log_%s.jsonl.gz", timestamp))
+	filePath := filepath.Join("./data", fmt.Sprintf("log_%d_%s.jsonl.zst", idx, timestamp))
 	f, err := os.Create(filePath)
 	if err != nil {
 		log.Fatalf("Failed to create log file: %v", err)
 	}
-	logFile = f
-	gzipWriter = gzip.NewWriter(logFile)
+	logFiles[idx] = f
+	encoder, err := zstd.NewWriter(f, zstd.WithEncoderLevel(zstd.SpeedFastest))
+	if err != nil {
+		log.Fatalf("Failed to create zstd writer: %v", err)
+	}
+	zstdWriters[idx] = encoder
 	fileRotationCount++
 	log.Printf("Started new log file: %s", filePath)
 }
 
-func closeLogFile() {
-	if gzipWriter != nil {
-		gzipWriter.Close()
+func closeLogFile(idx int) {
+	if zstdWriters[idx] != nil {
+		zstdWriters[idx].Close()
 	}
-	if logFile != nil {
-		logFile.Close()
+	if logFiles[idx] != nil {
+		logFiles[idx].Close()
 	}
 }
 
 func metricsLogger() {
 	for range rateTicker.C {
-		mutex.Lock()
-		rate := processCount
-		bytesPerSec := totalBytes
+		// Use atomic loads for all counters
+		rate := atomic.LoadInt64(&processCount)
+		bytesPerSec := atomic.LoadInt64(&totalBytes)
+		totalLat := atomic.LoadInt64(&totalLatency)
+		latCount := atomic.LoadInt64(&latencyCount)
+		queueLen := atomic.LoadInt64(&queueLength)
+		maxQueue := atomic.LoadInt64(&maxQueueLength)
+		rotations := atomic.LoadInt32((*int32)(&fileRotationCount))
+		dropped := atomic.LoadInt64(&droppedLogs)
+
 		avgLatency := float64(0)
-		if latencyCount > 0 {
-			avgLatency = float64(totalLatency) / float64(latencyCount)
+		if latCount > 0 {
+			avgLatency = float64(totalLat) / float64(latCount)
 		}
-		queueLen := queueLength
-		rotations := fileRotationCount
+		if queueLen > maxQueue {
+			atomic.StoreInt64(&maxQueueLength, queueLen)
+			maxQueue = queueLen
+		}
+		numGoroutines := runtime.NumGoroutine()
 
-		processCount = 0
-		totalBytes = 0
-		totalLatency = 0
-		latencyCount = 0
-		mutex.Unlock()
+		// Reset counters
+		atomic.StoreInt64(&processCount, 0)
+		atomic.StoreInt64(&totalBytes, 0)
+		atomic.StoreInt64(&totalLatency, 0)
+		atomic.StoreInt64(&latencyCount, 0)
 
-		log.Printf("[METRIC] Logs/sec: %d, MB/s: %.2f, Latency: %.2fµs, Queue: %d, Rotations: %d",
-			rate, float64(bytesPerSec)/(1024*1024), avgLatency, queueLen, rotations)
+		var totalFileSize int64
+		for i := 0; i < numWriters; i++ {
+			if logFiles[i] != nil {
+				info, err := logFiles[i].Stat()
+				if err == nil {
+					totalFileSize += info.Size()
+				}
+			}
+		}
+
+		log.Printf("[METRIC] Logs/sec: %d, MB/s: %.2f, Latency: %.2fµs, Queue: %d (max: %d), Rotations: %d, Goroutines: %d, FileSize: %.2fMB, Dropped: %d",
+			rate, float64(bytesPerSec)/(1024*1024), avgLatency, queueLen, maxQueue, rotations, numGoroutines, float64(totalFileSize)/(1024*1024), dropped)
 	}
 }
+
 func recordLatency(d time.Duration) {
-	mutex.Lock()
-	totalLatency += d.Microseconds()
-	latencyCount++
-	mutex.Unlock()
+	atomic.AddInt64(&totalLatency, d.Microseconds())
+	atomic.AddInt64(&latencyCount, 1)
 }
 
 func startHTTPServer() {
 	http.Handle("/", http.FileServer(http.Dir("./static")))
 	http.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
-		mutex.Lock()
-		defer mutex.Unlock()
-		fmt.Fprintf(w, `{"logs_per_sec": %d, "mb_per_sec": %.2f, "latency_us": %.2f, "queue_length": %d, "file_rotations": %d}`,
-			processCount,
-			float64(totalBytes)/(1024*1024),
-			float64(totalLatency)/float64(latencyCount),
-			queueLength,
-			fileRotationCount)
+		// Use atomic loads for consistency with metricsLogger
+		rate := atomic.LoadInt64(&processCount)
+		bytesPerSec := atomic.LoadInt64(&totalBytes)
+		totalLat := atomic.LoadInt64(&totalLatency)
+		latCount := atomic.LoadInt64(&latencyCount)
+		queueLen := atomic.LoadInt64(&queueLength)
+		rotations := atomic.LoadInt32((*int32)(&fileRotationCount))
+		dropped := atomic.LoadInt64(&droppedLogs)
+
+		avgLatency := float64(0)
+		if latCount > 0 {
+			avgLatency = float64(totalLat) / float64(latCount)
+		}
+
+		fmt.Fprintf(w, `{"logs_per_sec": %d, "mb_per_sec": %.2f, "latency_us": %.2f, "queue_length": %d, "file_rotations": %d, "dropped": %d}`,
+			rate,
+			float64(bytesPerSec)/(1024*1024),
+			avgLatency,
+			queueLen,
+			rotations,
+			dropped,
+		)
 	})
 	log.Println("Metrics available at http://localhost:8080/metrics")
 	http.ListenAndServe(":8080", nil)
