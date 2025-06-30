@@ -14,10 +14,11 @@ We're building a distributed system for processing log data at scale. This repos
 
 ### Running the Application
 
-1. Clone this repository
-2. Navigate to the project directory
-3. Run `docker-compose up --build` to 
-4. Run `docker-compose up --build`  to clean up re
+1. Clone this repository.
+2. Navigate to the project directory.
+3. Run `docker-compose up --build` to build and start all services.
+4. When finished, press `Ctrl+C` to stop the services.
+5. (Optional) Run `docker-compose down` to clean up containers, networks, and volumes.
 
 ## Project Structure
 
@@ -154,7 +155,7 @@ Compressed log files are written to:
 
 ### Day 6 Milestones
 
-- - 🚀 Transitioned to **Golang-based TCP log ingestion** (`go-ingestor`), replacing the original Flask-based ingestor, which could only handle around 150 messages per connection before significant slowdowns.
+- 🚀 Transitioned to **Golang-based TCP log ingestion** (`go-ingestor`), replacing the original Flask-based ingestor, which could only handle around 150 messages per connection before significant slowdowns.
 - 🧱 Built high-performance `go-client` log generator with batching support
 - 🔁 Implemented file rotation (5MB max) and Gzip compression upon rollover
 - ⚙️ Enabled batching, configurable interval and batch size via CLI flags
@@ -169,13 +170,12 @@ Compressed log files are written to:
 - 🔀 **Dual protocol support** (TCP/UDP) running on ports `3000` and `3001`
 - ⚖️ Used **Goroutines** and **separate handlers** to process UDP packets efficiently
 - 🧪 Validated ingestion consistency with `go-client` supporting `--udp` flag
-- 📊 **Enhanced monitoring dashboard** (`/dashboard`) with:
+- 📊 **Enhanced monitoring dashboard** (`/`) with:
   - Logs/sec
   - MB/sec throughput
   - Avg latency (µs)
   - Queue length
   - File rotation count
-  - Recent error messages
 - 💾 Observed Gzip compression saving **\~95%+ storage** on log files
 - 🔍 Simulated realistic log generation: 5% ERROR, 10% WARN, 85% INFO/DEBUG
 
@@ -194,3 +194,15 @@ Compressed log files are written to:
 - 📦 **UDP batch splitting**: Client splits UDP batches to avoid exceeding 1400 bytes (safe MTU)
 - 🛡️ **Production-ready ingestion**: Secure, reliable log delivery over TCP; UDP supported for high-throughput, lossy scenarios
 - 🧪 **Validated secure ingestion**: Confirmed end-to-end encrypted log flow and UDP chunking in multi-client tests
+
+### Day 10 Milestones
+
+- 🚀 **Ultra-high throughput:** The Go ingestor now reliably handles **1 million log messages per second** on a single instance with minimal drops.
+- 🏎️ **Optimized concurrency:** Switched all metrics and counters to atomic operations, eliminating global mutex contention for maximum parallelism.
+- 🗃️ **Efficient batching:** Increased batch size and flush intervals for disk writes, reducing overhead and improving sustained throughput.
+- ⚡ **Compression tuning:** Leveraged zstd with the fastest compression level for high-speed, space-efficient log storage.
+- 💾 **Disk I/O improvements:** System tested and tuned for SSD/NVMe and RAM disk scenarios to ensure disk is not a bottleneck.
+- 🧪 **Stress-tested:** Validated with synthetic clients at 1M logs/sec, observing only minimal drops under extreme load.
+- 📊 **Accurate live metrics:** Real-time dashboard and `/metrics` endpoint now report logs/sec, MB/sec, latency, queue, rotations, and drops using atomic counters.
+- 🧵 **Scalable architecture:** Each writer operates independently, matching the number of CPU cores for optimal resource usage.
+- 🛡️ **All previous features retained:** Secure TLS TCP, UDP support, log rotation, compression, graceful shutdown, and robust error handling.

@@ -2,19 +2,27 @@ services:
   go-ingestor:
     build:
       context: ./src/services/go-ingestor
-    volumes:
-      - ./data/:/app/data
+    #volumes:
+    #- ./data/:/app/data
     ports:
       - "8080:8080"
+
   go-client-1:
     build:
       context: ./src/services/go-client
-    command: ["./go-client", "--batch", "500", "--interval", "10"]
+    command: ["./go-client", "--batch", "3000", "--interval", "10"]
     depends_on:
       - go-ingestor
+
   go-client-2:
     build:
       context: ./src/services/go-client
-    command: ["./go-client", "--batch", "500", "--interval", "10", "--udp"]
+    command: ["./go-client", "--batch", "3000", "--interval", "10"]
+    depends_on:
+      - go-ingestor
+  go-client-3:
+    build:
+      context: ./src/services/go-client
+    command: ["./go-client", "--batch", "3000", "--interval", "10"]
     depends_on:
       - go-ingestor
