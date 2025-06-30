@@ -5,24 +5,40 @@ services:
     #volumes:
     #- ./data/:/app/data
     ports:
-      - "8080:8080"
+      - "3000:3000"
 
   go-client-1:
     build:
       context: ./src/services/go-client
-    command: ["./go-client", "--batch", "3000", "--interval", "10"]
+    command:
+      [
+        "./go-client",
+        "--batch",
+        "5000",
+        "--interval",
+        "10",
+        "--format",
+        "proto",
+        "--tcp-port",
+        "3003",
+      ]
     depends_on:
       - go-ingestor
 
   go-client-2:
     build:
       context: ./src/services/go-client
-    command: ["./go-client", "--batch", "3000", "--interval", "10"]
-    depends_on:
-      - go-ingestor
-  go-client-3:
-    build:
-      context: ./src/services/go-client
-    command: ["./go-client", "--batch", "3000", "--interval", "10"]
+    command:
+      [
+        "./go-client",
+        "--batch",
+        "5000",
+        "--interval",
+        "10",
+        "--format",
+        "proto",
+        "--tcp-port",
+        "3003",
+      ]
     depends_on:
       - go-ingestor

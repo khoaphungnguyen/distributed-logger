@@ -6,11 +6,13 @@ package main
 import (
 	"bufio"
 	"bytes"
+	logpb "go-ingestor/proto"
 	"hash/crc32"
 	"sync/atomic"
 
 	// "compress/gzip" // REMOVE this line
 	"crypto/tls"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -24,7 +26,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/klauspost/compress/zstd" // ADD this line
+	"github.com/klauspost/compress/zstd"
+	"google.golang.org/protobuf/proto"
 )
 
 type LogEntry struct {
@@ -33,6 +36,47 @@ type LogEntry struct {
 	Message   string `json:"message"`
 	Service   string `json:"service"`
 }
+
+func (e *LogEntry) Validate() error {
+	if e.Timestamp == "" {
+		return fmt.Errorf("missing timestamp")
+	}
+	if _, err := time.Parse(time.RFC3339, e.Timestamp); err != nil {
+		return fmt.Errorf("invalid timestamp format: %v", err)
+	}
+	if e.Level == "" {
+		return fmt.Errorf("missing level")
+	}
+	allowedLevels := map[string]bool{"INFO": true, "WARN": true, "ERROR": true, "DEBUG": true}
+	if !allowedLevels[e.Level] {
+		return fmt.Errorf("invalid level: %s", e.Level)
+	}
+	if e.Message == "" {
+		return fmt.Errorf("missing message")
+	}
+	if len(e.Message) > 2048 {
+		return fmt.Errorf("message too long")
+	}
+	if e.Service == "" {
+		return fmt.Errorf("missing service")
+	}
+	if len(e.Service) > 128 {
+		return fmt.Errorf("service name too long")
+	}
+	return nil
+}
+
+type MetricsSnapshot struct {
+	LogsPerSec    int64
+	MBPerSec      float64
+	LatencyUs     float64
+	QueueLength   int64
+	FileRotations int32
+	Dropped       int64
+}
+
+var lastMetrics MetricsSnapshot
+var metricsMutex sync.Mutex
 
 const numWriters = 12
 
@@ -44,8 +88,7 @@ var zstdWriters [numWriters]*zstd.Encoder
 var writerLocks [numWriters]sync.Mutex
 
 var (
-	logFile *os.File
-	// gzipWriter        *gzip.Writer // REMOVE this line
+	logFile           *os.File
 	mutex             sync.Mutex
 	processCount      int64
 	rotationSize      = int64(50 * 1024 * 1024) // 50MB
@@ -57,16 +100,18 @@ var (
 	fileRotationCount int32
 	maxQueueLength    int64
 	droppedLogs       int64
+	logFormat         string // "json" or "proto"
 )
 
 func main() {
 	setupFile()
 	for i := 0; i < numWriters; i++ {
-		logChans[i] = make(chan LogEntry, 100000)
+		logChans[i] = make(chan LogEntry, 200000)
 		go writerWorker(i)
 	}
 	go metricsLogger()
-	go startTCPServer()
+	go startTCPServerJSON() // JSON on :3001
+	go startTCPServerProto()
 	go startUDPServer()
 	go startHTTPServer()
 
@@ -90,18 +135,19 @@ func setupFile() {
 	}
 }
 
-func startTCPServer() {
+// --- New: JSON TCP server on :3001 ---
+func startTCPServerJSON() {
 	cert, err := tls.LoadX509KeyPair("./certs/cert.pem", "./certs/key.pem")
 	if err != nil {
 		log.Fatalf("Failed to load TLS certs: %v", err)
 	}
 	config := &tls.Config{Certificates: []tls.Certificate{cert}}
 
-	listener, err := tls.Listen("tcp", ":3000", config)
+	listener, err := tls.Listen("tcp", ":3001", config)
 	if err != nil {
-		log.Fatalf("Failed to listen on TCP port 3000: %v", err)
+		log.Fatalf("Failed to listen on TCP port 3001: %v", err)
 	}
-	log.Println("TLS TCP log ingestor listening on :3000")
+	log.Println("TLS TCP (JSON) log ingestor listening on :3001")
 
 	for {
 		conn, err := listener.Accept()
@@ -109,20 +155,45 @@ func startTCPServer() {
 			log.Printf("TCP Accept error: %v", err)
 			continue
 		}
-		go handleConnection(conn)
+		go handleConnectionJSON(conn)
 	}
 }
 
+// --- New: Proto TCP server on :3003 ---
+func startTCPServerProto() {
+	cert, err := tls.LoadX509KeyPair("./certs/cert.pem", "./certs/key.pem")
+	if err != nil {
+		log.Fatalf("Failed to load TLS certs: %v", err)
+	}
+	config := &tls.Config{Certificates: []tls.Certificate{cert}}
+
+	listener, err := tls.Listen("tcp", ":3003", config)
+	if err != nil {
+		log.Fatalf("Failed to listen on TCP port 3003: %v", err)
+	}
+	log.Println("TLS TCP (PROTOBUF) log ingestor listening on :3003")
+
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			log.Printf("TCP Accept error: %v", err)
+			continue
+		}
+		go handleConnectionProto(conn)
+	}
+}
+
+// --- JSON UDP server on :3002 ---
 func startUDPServer() {
-	addr, err := net.ResolveUDPAddr("udp", ":3001")
+	addr, err := net.ResolveUDPAddr("udp", ":3002")
 	if err != nil {
 		log.Fatalf("Failed to resolve UDP port: %v", err)
 	}
 	conn, err := net.ListenUDP("udp", addr)
 	if err != nil {
-		log.Fatalf("Failed to listen on UDP port 3001: %v", err)
+		log.Fatalf("Failed to listen on UDP port 3002: %v", err)
 	}
-	log.Println("UDP log ingestor listening on :3001")
+	log.Println("UDP log ingestor listening on :3002")
 
 	buf := make([]byte, 65535)
 	for {
@@ -141,8 +212,9 @@ func startUDPServer() {
 				log.Printf("Invalid UDP log format: %v", err)
 				continue
 			}
-			if entry.Timestamp == "" {
-				entry.Timestamp = time.Now().UTC().Format(time.RFC3339)
+			if err := entry.Validate(); err != nil {
+				log.Printf("Invalid log entry: %v", err)
+				continue
 			}
 			enqueueLog(entry)
 			recordLatency(time.Since(start))
@@ -153,7 +225,8 @@ func startUDPServer() {
 	}
 }
 
-func handleConnection(conn net.Conn) {
+// --- Handler for JSON ---
+func handleConnectionJSON(conn net.Conn) {
 	defer conn.Close()
 	scanner := bufio.NewScanner(conn)
 	for scanner.Scan() {
@@ -161,17 +234,69 @@ func handleConnection(conn net.Conn) {
 		var entry LogEntry
 		line := scanner.Bytes()
 		if err := json.Unmarshal(line, &entry); err != nil {
-			log.Printf("Invalid TCP log format: %v", err)
+			log.Printf("Invalid TCP JSON log format: %v", err)
 			continue
 		}
-		if entry.Timestamp == "" {
-			entry.Timestamp = time.Now().UTC().Format(time.RFC3339)
+		if err := entry.Validate(); err != nil {
+			log.Printf("Invalid log entry: %v", err)
+			continue
 		}
 		enqueueLog(entry)
 		recordLatency(time.Since(start))
 	}
 	if err := scanner.Err(); err != nil {
 		log.Printf("TCP scanner error: %v", err)
+	}
+}
+
+// --- Handler for Proto ---
+func handleConnectionProto(conn net.Conn) {
+	defer conn.Close()
+	buf := make([]byte, 0, 64*1024)
+	tmp := make([]byte, 64*1024)
+	for {
+		// Always try to parse as many messages as possible
+		for {
+			if len(buf) < 4 {
+				break
+			}
+			msgLen := binary.BigEndian.Uint32(buf[:4])
+			if msgLen == 0 || msgLen > 10*1024 {
+				log.Printf("Invalid proto message length: %d", msgLen)
+				return
+			}
+			if len(buf) < int(4+msgLen) {
+				break
+			}
+			start := time.Now()
+			msgBuf := buf[4 : 4+msgLen]
+			var pbEntry logpb.LogEntry
+			if err := proto.Unmarshal(msgBuf, &pbEntry); err != nil {
+				log.Printf("Invalid TCP proto log format: %v", err)
+				buf = buf[4+msgLen:]
+				continue
+			}
+			entry := LogEntry{
+				Timestamp: pbEntry.Timestamp,
+				Level:     pbEntry.Level,
+				Message:   pbEntry.Message,
+				Service:   pbEntry.Service,
+			}
+			if err := entry.Validate(); err != nil {
+				log.Printf("Invalid log entry: %v", err)
+				buf = buf[4+msgLen:]
+				continue
+			}
+			enqueueLog(entry)
+			recordLatency(time.Since(start))
+			buf = buf[4+msgLen:]
+		}
+		// Read more data if not enough for a full message
+		n, err := conn.Read(tmp)
+		if err != nil {
+			return
+		}
+		buf = append(buf, tmp[:n]...)
 	}
 }
 
@@ -196,7 +321,7 @@ func enqueueLog(entry LogEntry) {
 func writerWorker(idx int) {
 	rotateLogFile(idx)
 	buffer := make([]LogEntry, 0, 100000)
-	flushTimer := time.NewTicker(1000 * time.Millisecond)
+	flushTimer := time.NewTicker(500 * time.Millisecond)
 	defer flushTimer.Stop()
 
 	for {
@@ -277,7 +402,7 @@ func closeLogFile(idx int) {
 
 func metricsLogger() {
 	for range rateTicker.C {
-		// Use atomic loads for all counters
+		metricsMutex.Lock()
 		rate := atomic.LoadInt64(&processCount)
 		bytesPerSec := atomic.LoadInt64(&totalBytes)
 		totalLat := atomic.LoadInt64(&totalLatency)
@@ -297,6 +422,16 @@ func metricsLogger() {
 		}
 		numGoroutines := runtime.NumGoroutine()
 
+		// Save snapshot for HTTP
+		lastMetrics = MetricsSnapshot{
+			LogsPerSec:    rate,
+			MBPerSec:      float64(bytesPerSec) / (1024 * 1024),
+			LatencyUs:     avgLatency,
+			QueueLength:   queueLen,
+			FileRotations: rotations,
+			Dropped:       dropped,
+		}
+
 		// Reset counters
 		atomic.StoreInt64(&processCount, 0)
 		atomic.StoreInt64(&totalBytes, 0)
@@ -315,6 +450,7 @@ func metricsLogger() {
 
 		log.Printf("[METRIC] Logs/sec: %d, MB/s: %.2f, Latency: %.2fµs, Queue: %d (max: %d), Rotations: %d, Goroutines: %d, FileSize: %.2fMB, Dropped: %d",
 			rate, float64(bytesPerSec)/(1024*1024), avgLatency, queueLen, maxQueue, rotations, numGoroutines, float64(totalFileSize)/(1024*1024), dropped)
+		metricsMutex.Unlock()
 	}
 }
 
@@ -326,29 +462,18 @@ func recordLatency(d time.Duration) {
 func startHTTPServer() {
 	http.Handle("/", http.FileServer(http.Dir("./static")))
 	http.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
-		// Use atomic loads for consistency with metricsLogger
-		rate := atomic.LoadInt64(&processCount)
-		bytesPerSec := atomic.LoadInt64(&totalBytes)
-		totalLat := atomic.LoadInt64(&totalLatency)
-		latCount := atomic.LoadInt64(&latencyCount)
-		queueLen := atomic.LoadInt64(&queueLength)
-		rotations := atomic.LoadInt32((*int32)(&fileRotationCount))
-		dropped := atomic.LoadInt64(&droppedLogs)
-
-		avgLatency := float64(0)
-		if latCount > 0 {
-			avgLatency = float64(totalLat) / float64(latCount)
-		}
-
+		metricsMutex.Lock()
+		snap := lastMetrics
+		metricsMutex.Unlock()
 		fmt.Fprintf(w, `{"logs_per_sec": %d, "mb_per_sec": %.2f, "latency_us": %.2f, "queue_length": %d, "file_rotations": %d, "dropped": %d}`,
-			rate,
-			float64(bytesPerSec)/(1024*1024),
-			avgLatency,
-			queueLen,
-			rotations,
-			dropped,
+			snap.LogsPerSec,
+			snap.MBPerSec,
+			snap.LatencyUs,
+			snap.QueueLength,
+			snap.FileRotations,
+			snap.Dropped,
 		)
 	})
-	log.Println("Metrics available at http://localhost:8080/metrics")
-	http.ListenAndServe(":8080", nil)
+	log.Println("Dashboard available at http://localhost:3000")
+	http.ListenAndServe(":3000", nil)
 }

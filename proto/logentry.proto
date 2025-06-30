@@ -1,0 +1,12 @@
+syntax = "proto3";
+
+package log;
+
+option go_package = "distributed-logger/proto;logpb";
+
+message LogEntry {
+  string timestamp = 1;
+  string level = 2;
+  string message = 3;
+  string service = 4;
+}

@@ -36,24 +36,29 @@ We're building a distributed system for processing log data at scale. This repos
 
 - Simulates real-time log generation with random levels, messages, and services
 - Supports configurable **batch size**, **send interval**, **address**, and **protocol** (TCP/UDP) via CLI flags
+- **Supports both JSON and Protobuf formats** for log transmission (`--format json` or `--format proto`)
 - **Graceful shutdown**: Handles SIGINT/SIGTERM for safe exit and resource cleanup
 - **UDP batch splitting**: Automatically splits large batches to avoid exceeding safe MTU (1400 bytes)
 - **UDP batch size warning**: Warns if any UDP chunk exceeds safe MTU
 - **Retry mechanism**: Retries failed batch transmissions up to 3 times
 - **Enhanced metrics**: Tracks and logs sent/failed batch counts, with periodic stats output
-- **Improved error handling**: Handles JSON marshal errors and connection issues robustly
+- **Improved error handling**: Handles JSON/proto marshal errors and connection issues robustly
 - **TLS encryption**: Uses TLS for secure TCP log transmission
+- **Efficient batching**: Batches multiple proto or JSON messages into a single write for maximum throughput
 
 ## ✅ Go Ingestor (Server)
 
 - **TLS-encrypted TCP ingestion** for secure log reception
 - **UDP ingestion** for high-throughput, lossy log reception
+- **Supports both JSON and Protobuf formats** on separate ports
 - Handles each client in a separate goroutine
+- **Schema validation** for both JSON and Protobuf logs
 - Logs are written to file via buffered writer
-- Tracks and prints real-time **logs/sec**, **MB/sec**, **latency**, **queue length**, and **file rotations**
-- Supports **log rotation at 5MB** and **gzip compression** upon rotation
+- Tracks and prints real-time **logs/sec**, **MB/sec**, **latency**, **queue length**, **file rotations**, and **dropped logs**
+- Supports **log rotation at 50MB** and **zstd compression** upon rotation
 - Buffered channel and writer for asynchronous disk I/O
 - Built-in web dashboard (`/`) and `/metrics` endpoint for live stats
+- **Highly concurrent**: Each writer operates independently, matching the number of CPU cores
 
 ---
 
@@ -61,20 +66,25 @@ We're building a distributed system for processing log data at scale. This repos
 
 You can pass flags to the Go client container to configure its behavior:
 
-| Flag           | Description                              | Default      |
-| -------------- | ---------------------------------------- | ------------ |
-| `--batch`      | Number of logs to send per batch         | `100`        |
-| `--interval`   | Interval in milliseconds between batches | `1000`       |
-| `--address`    | Ingestor host address                    | `go-ingestor`|
-| `--tcp-port`   | TCP port for ingestion                   | `3000`       |
-| `--udp-port`   | UDP port for ingestion                   | `3001`       |
-| `--udp`        | Use UDP instead of TCP                   | `false`      |
+| Flag         | Description                              | Default       |
+| ------------ | ---------------------------------------- | ------------- |
+| `--batch`    | Number of logs to send per batch         | `100`         |
+| `--interval` | Interval in milliseconds between batches | `1000`        |
+| `--address`  | Ingestor host address                    | `go-ingestor` |
+| `--tcp-port` | TCP port for ingestion                   | `3000`        |
+| `--udp-port` | UDP port for ingestion                   | `3001`        |
+| `--udp`      | Use UDP instead of TCP                   | `false`       |
+| `--format`   | Log format: `json` or `proto`            | `json`        |
+
+**Protobuf mode:**
+
+- Use `--format proto` and set `--tcp-port` to the proto port (default: `3002` or `3003` depending on your setup).
 
 Example:
 
 ```yaml
 go-client:
-  command: --batch 500 --interval 10 --address go-ingestor --tcp-port 3000 --udp-port 3001 --udp
+  command: --batch 500 --interval 10 --address go-ingestor --tcp-port 3002 --format proto
 ```
 
 ---
@@ -96,13 +106,13 @@ Place `cert.pem` and `key.pem` in the appropriate directory (e.g., `src/services
 Server prints logs processed per second and other metrics:
 
 ```
-go-ingestor_1  | 2025/06/27 16:54:59 [METRIC] Logs/sec: 100001, MB/s: 9.78, Latency: 1.21µs, Queue: 19, Rotations: 2
+go-ingestor_1  | 2025/06/30 21:59:23 [METRIC] Logs/sec: 1104395, MB/s: 104.41, Latency: 0.47µs, Queue: 0 (max: 85803), Rotations: 12, Goroutines: 23, FileSize: 199.16MB, Dropped: 132248
 ```
 
 Compressed log files are written to:
 
 ```
-/app/data/log_20250627_165447.jsonl.gz
+/app/data/log_0_20250630_214517.jsonl.zst
 ```
 
 ---
@@ -206,3 +216,12 @@ Compressed log files are written to:
 - 📊 **Accurate live metrics:** Real-time dashboard and `/metrics` endpoint now report logs/sec, MB/sec, latency, queue, rotations, and drops using atomic counters.
 - 🧵 **Scalable architecture:** Each writer operates independently, matching the number of CPU cores for optimal resource usage.
 - 🛡️ **All previous features retained:** Secure TLS TCP, UDP support, log rotation, compression, graceful shutdown, and robust error handling.
+
+### Day 11 Milestones
+
+- 🟣 **Full Protobuf support:** Ingestor and client now support high-throughput, length-prefixed Protobuf log streaming with batching.
+- 🟣 **Schema validation for Protobuf:** Protobuf log entries are validated with the same strict schema checks as JSON logs.
+- 🟣 **Unified metrics:** Both JSON and Protobuf ingestion paths now report accurate, synchronized live metrics.
+- 🟣 **Dashboard improvements:** Web dashboard and `/metrics` endpoint now reflect true logs/sec and other stats for both formats.
+- 🟣 **Production-grade ingestion:** System validated at >1M logs/sec with multiple clients, minimal drops, and robust error handling for both formats.
+- 🟣 **Latency breakthrough:** Protobuf ingestion latency reduced from 1–2 µs (microseconds) to as low as **0.2 µs** per log entry, surpassing previous JSON performance.
