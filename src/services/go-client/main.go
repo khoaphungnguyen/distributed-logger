@@ -16,7 +16,15 @@ import (
 
 	logpb "go-client/proto"
 
+	"github.com/hamba/avro/v2"
 	"google.golang.org/protobuf/proto"
+)
+
+const (
+	formatJSON  = 0x01
+	formatProto = 0x02
+	formatAvro  = 0x03
+	formatRaw   = 0x04
 )
 
 type LogEntry struct {
@@ -25,6 +33,19 @@ type LogEntry struct {
 	Level     string `json:"level"`
 	Message   string `json:"message"`
 }
+
+var avroSchema = `{
+  "type": "record",
+  "name": "LogEntry",
+  "fields": [
+    {"name": "timestamp", "type": "string"},
+    {"name": "level", "type": "string"},
+    {"name": "message", "type": "string"},
+    {"name": "service", "type": "string"}
+  ]
+}`
+
+var avroCodec = avro.MustParse(avroSchema)
 
 var levels = []string{"DEBUG", "INFO", "WARN", "ERROR"}
 var services = []string{"auth", "payment", "api", "db", "notification"}
@@ -68,13 +89,18 @@ func main() {
 
 	// Configurable address and port
 	address := flag.String("address", "go-ingestor", "Ingestor host address")
-	tcpPort := flag.String("tcp-port", "3001", "TCP port")
+	tcpPort := flag.String("tcp-port", "", "TCP port (auto by format if empty)")
 	udpPort := flag.String("udp-port", "3002", "UDP port")
 	batchSize := flag.Int("batch", 100, "Number of logs per batch")
 	intervalMs := flag.Int("interval", 100, "Interval in milliseconds between batches")
 	useUDP := flag.Bool("udp", false, "Use UDP instead of TCP")
-	format := flag.String("format", "json", "Log format: json or proto")
+	format := flag.String("format", "json", "Log format: json, proto, avro, or raw")
 	flag.Parse()
+
+	// Always use universal handler on TCP port 3001
+	if !*useUDP {
+		*tcpPort = "3001"
+	}
 
 	// Graceful shutdown
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -87,10 +113,6 @@ func main() {
 		addr = *address + ":" + *udpPort
 		conn, err = net.Dial("udp", addr)
 	} else {
-		// Use port 3003 for proto, 3001 for json
-		if *format == "proto" {
-			*tcpPort = "3003"
-		}
 		addr = *address + ":" + *tcpPort
 		tlsConfig := &tls.Config{
 			InsecureSkipVerify: true,
@@ -111,7 +133,6 @@ func main() {
 	ticker := time.NewTicker(time.Duration(*intervalMs) * time.Millisecond)
 	defer ticker.Stop()
 
-	// Metrics
 	var sentBatches, failedBatches int
 
 loop:
@@ -121,37 +142,75 @@ loop:
 			log.Println("Received shutdown signal, exiting...")
 			break loop
 		case <-ticker.C:
-			if *format == "proto" && !*useUDP {
-				// Batch proto messages into a single write
+			switch {
+			case !*useUDP:
+				// Always use universal handler for TCP
 				var batchBuf = make([]byte, 0, *batchSize*128)
+				var header byte
+				switch *format {
+				case "json":
+					header = formatJSON
+				case "proto":
+					header = formatProto
+				case "avro":
+					header = formatAvro
+				case "raw":
+					header = formatRaw
+				default:
+					header = formatJSON
+				}
 				for i := 0; i < *batchSize; i++ {
-					entry := randomLog()
-					pbEntry := &logpb.LogEntry{
-						Timestamp: entry.Timestamp,
-						Level:     entry.Level,
-						Message:   entry.Message,
-						Service:   entry.Service,
+					var b []byte
+					var err error
+					switch *format {
+					case "json":
+						entry := randomLog()
+						b, err = json.Marshal(entry)
+					case "proto":
+						entry := randomLog()
+						pbEntry := &logpb.LogEntry{
+							Timestamp: entry.Timestamp,
+							Level:     entry.Level,
+							Message:   entry.Message,
+							Service:   entry.Service,
+						}
+						b, err = proto.Marshal(pbEntry)
+					case "avro":
+						entry := randomLog()
+						avroMap := map[string]interface{}{
+							"timestamp": entry.Timestamp,
+							"level":     entry.Level,
+							"message":   entry.Message,
+							"service":   entry.Service,
+						}
+						b, err = avro.Marshal(avroCodec, avroMap)
+					case "raw":
+						entry := randomLog()
+						rawLine := entry.Timestamp + " [" + entry.Level + "] [" + entry.Service + "] " + entry.Message
+						b = []byte(rawLine)
+					default:
+						entry := randomLog()
+						b, err = json.Marshal(entry)
 					}
-					b, err := proto.Marshal(pbEntry)
 					if err != nil {
-						log.Printf("Failed to marshal proto log entry: %v", err)
+						log.Printf("Failed to marshal log entry: %v", err)
 						continue
 					}
 					lenBuf := make([]byte, 4)
 					binary.BigEndian.PutUint32(lenBuf, uint32(len(b)))
+					batchBuf = append(batchBuf, header)
 					batchBuf = append(batchBuf, lenBuf...)
 					batchBuf = append(batchBuf, b...)
 				}
-				// Send the whole batch at once
 				err = sendWithRetry(conn, batchBuf, 3)
 				if err != nil {
-					log.Printf("Failed to send proto batch after retries: %v", err)
+					log.Printf("Failed to send universal batch after retries: %v", err)
 					failedBatches++
 				} else {
 					sentBatches++
 				}
-			} else {
-				// JSON or UDP (always JSON)
+			default:
+				// UDP (always JSON)
 				var batch []string
 				for i := 0; i < *batchSize; i++ {
 					entry := randomLog()
@@ -163,27 +222,16 @@ loop:
 					batch = append(batch, string(b))
 				}
 
-				if *useUDP {
-					const maxUDPPacket = 1400
-					chunks := splitBatchForUDP(batch, maxUDPPacket)
-					for i, chunk := range chunks {
-						chunkData := strings.Join(chunk, "\n") + "\n"
-						if len(chunkData) > maxUDPPacket {
-							log.Printf("Warning: UDP chunk %d size (%d bytes) exceeds safe MTU", i, len(chunkData))
-						}
-						err := sendWithRetry(conn, []byte(chunkData), 3)
-						if err != nil {
-							log.Printf("Failed to send UDP chunk %d after retries: %v", i, err)
-							failedBatches++
-						} else {
-							sentBatches++
-						}
+				const maxUDPPacket = 1400
+				chunks := splitBatchForUDP(batch, maxUDPPacket)
+				for i, chunk := range chunks {
+					chunkData := strings.Join(chunk, "\n") + "\n"
+					if len(chunkData) > maxUDPPacket {
+						log.Printf("Warning: UDP chunk %d size (%d bytes) exceeds safe MTU", i, len(chunkData))
 					}
-				} else {
-					batchData := strings.Join(batch, "\n") + "\n"
-					err := sendWithRetry(conn, []byte(batchData), 3)
+					err := sendWithRetry(conn, []byte(chunkData), 3)
 					if err != nil {
-						log.Printf("Failed to send batch after retries: %v", err)
+						log.Printf("Failed to send UDP chunk %d after retries: %v", i, err)
 						failedBatches++
 					} else {
 						sentBatches++

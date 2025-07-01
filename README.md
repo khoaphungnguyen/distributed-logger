@@ -36,29 +36,30 @@ We're building a distributed system for processing log data at scale. This repos
 
 - Simulates real-time log generation with random levels, messages, and services
 - Supports configurable **batch size**, **send interval**, **address**, and **protocol** (TCP/UDP) via CLI flags
-- **Supports both JSON and Protobuf formats** for log transmission (`--format json` or `--format proto`)
-- **Graceful shutdown**: Handles SIGINT/SIGTERM for safe exit and resource cleanup
-- **UDP batch splitting**: Automatically splits large batches to avoid exceeding safe MTU (1400 bytes)
-- **UDP batch size warning**: Warns if any UDP chunk exceeds safe MTU
-- **Retry mechanism**: Retries failed batch transmissions up to 3 times
-- **Enhanced metrics**: Tracks and logs sent/failed batch counts, with periodic stats output
-- **Improved error handling**: Handles JSON/proto marshal errors and connection issues robustly
-- **TLS encryption**: Uses TLS for secure TCP log transmission
-- **Efficient batching**: Batches multiple proto or JSON messages into a single write for maximum throughput
+- **Supports JSON, Protobuf, Avro, and Raw formats** for log transmission (`--format json`, `--format proto`, `--format avro`, or `--format raw`)
+- **Universal handler:** All formats are sent over a single secure TCP port (`3001`) with a format header for seamless ingestion
+- **Graceful shutdown:** Handles SIGINT/SIGTERM for safe exit and resource cleanup
+- **UDP batch splitting:** Automatically splits large batches to avoid exceeding safe MTU (1400 bytes)
+- **UDP batch size warning:** Warns if any UDP chunk exceeds safe MTU
+- **Retry mechanism:** Retries failed batch transmissions up to 3 times
+- **Enhanced metrics:** Tracks and logs sent/failed batch counts, with periodic stats output
+- **Improved error handling:** Handles marshal errors and connection issues robustly
+- **TLS encryption:** Uses TLS for secure TCP log transmission
+- **Efficient batching:** Batches multiple messages into a single write for maximum throughput
 
 ## ✅ Go Ingestor (Server)
 
 - **TLS-encrypted TCP ingestion** for secure log reception
-- **UDP ingestion** for high-throughput, lossy log reception
-- **Supports both JSON and Protobuf formats** on separate ports
+- **Universal handler:** Accepts JSON, Protobuf, Avro, and Raw logs on a single TCP port (`3001`) using a format header
+- **UDP ingestion** for high-throughput, lossy log reception (JSON only, port `3002`)
 - Handles each client in a separate goroutine
-- **Schema validation** for both JSON and Protobuf logs
+- **Schema validation** for all formats
 - Logs are written to file via buffered writer
 - Tracks and prints real-time **logs/sec**, **MB/sec**, **latency**, **queue length**, **file rotations**, and **dropped logs**
 - Supports **log rotation at 50MB** and **zstd compression** upon rotation
 - Buffered channel and writer for asynchronous disk I/O
 - Built-in web dashboard (`/`) and `/metrics` endpoint for live stats
-- **Highly concurrent**: Each writer operates independently, matching the number of CPU cores
+- **Highly concurrent:** Each writer operates independently, matching the number of CPU cores
 
 ---
 
@@ -71,20 +72,21 @@ You can pass flags to the Go client container to configure its behavior:
 | `--batch`    | Number of logs to send per batch         | `100`         |
 | `--interval` | Interval in milliseconds between batches | `1000`        |
 | `--address`  | Ingestor host address                    | `go-ingestor` |
-| `--tcp-port` | TCP port for ingestion                   | `3000`        |
-| `--udp-port` | UDP port for ingestion                   | `3001`        |
+| `--tcp-port` | TCP port for ingestion                   | `3001`        |
+| `--udp-port` | UDP port for ingestion                   | `3002`        |
 | `--udp`      | Use UDP instead of TCP                   | `false`       |
-| `--format`   | Log format: `json` or `proto`            | `json`        |
+| `--format`   | Log format: `json`, `proto`, `avro`, or `raw` | `json`   |
 
-**Protobuf mode:**
+**Universal handler (default for TCP):**
 
-- Use `--format proto` and set `--tcp-port` to the proto port (default: `3002` or `3003` depending on your setup).
+- All formats (`json`, `proto`, `avro`, `raw`) are sent to TCP port `3001` with a format header.
+- UDP is only supported for JSON logs and uses port `3002`.
 
 Example:
 
 ```yaml
 go-client:
-  command: --batch 500 --interval 10 --address go-ingestor --tcp-port 3002 --format proto
+  command: --batch 500 --interval 10 --address go-ingestor --format avro
 ```
 
 ---
@@ -217,11 +219,19 @@ Compressed log files are written to:
 - 🧵 **Scalable architecture:** Each writer operates independently, matching the number of CPU cores for optimal resource usage.
 - 🛡️ **All previous features retained:** Secure TLS TCP, UDP support, log rotation, compression, graceful shutdown, and robust error handling.
 
-### Day 11 Milestones
+### 🚀 Day 11 Milestones
 
-- 🟣 **Full Protobuf support:** Ingestor and client now support high-throughput, length-prefixed Protobuf log streaming with batching.
-- 🟣 **Schema validation for Protobuf:** Protobuf log entries are validated with the same strict schema checks as JSON logs.
-- 🟣 **Unified metrics:** Both JSON and Protobuf ingestion paths now report accurate, synchronized live metrics.
-- 🟣 **Dashboard improvements:** Web dashboard and `/metrics` endpoint now reflect true logs/sec and other stats for both formats.
-- 🟣 **Production-grade ingestion:** System validated at >1M logs/sec with multiple clients, minimal drops, and robust error handling for both formats.
-- 🟣 **Latency breakthrough:** Protobuf ingestion latency reduced from 1–2 µs (microseconds) to as low as **0.2 µs** per log entry, surpassing previous JSON performance.
+- 🚀 **Full Protobuf support:** Ingestor and client now support high-throughput, length-prefixed Protobuf log streaming with batching.
+- 🏷️ **Schema validation for Protobuf:** Protobuf log entries are validated with the same strict schema checks as JSON logs.
+- 📊 **Unified metrics:** Both JSON and Protobuf ingestion paths now report accurate, synchronized live metrics.
+- 🖥️ **Dashboard improvements:** Web dashboard and `/metrics` endpoint now reflect true logs/sec and other stats for both formats.
+- 🏭 **Production-grade ingestion:** System validated at >1M logs/sec with multiple clients, minimal drops, and robust error handling for both formats.
+- ⚡ **Latency breakthrough:** Protobuf ingestion latency reduced from 1–2 µs (microseconds) to as low as **0.2 µs** per log entry, surpassing previous JSON performance.
+
+### 🚀 Day 12 Milestones
+
+- 📦 **Avro serialization support:** Both client and ingestor now support Avro log serialization and ingestion.
+- 🔄 **Universal handler:** All formats (Raw, JSON, Avro, Protobuf) are now handled on a single secure TCP port (`3001`) using a format header.
+- 📝 **Raw log support:** Clients can send human-readable raw log lines; server parses and normalizes them.
+- 🛠️ **Unified ingestion pipeline:** No more separate ports for different formats—universal handler simplifies deployment and scaling.
+- 🌐 **Validated at scale:** Multiple clients sending mixed formats concurrently, all ingested and normalized with accurate metrics and robust performance.

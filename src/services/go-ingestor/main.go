@@ -8,6 +8,7 @@ import (
 	"bytes"
 	logpb "go-ingestor/proto"
 	"hash/crc32"
+	"strings"
 	"sync/atomic"
 
 	// "compress/gzip" // REMOVE this line
@@ -26,6 +27,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/hamba/avro/v2"
 	"github.com/klauspost/compress/zstd"
 	"google.golang.org/protobuf/proto"
 )
@@ -78,6 +80,19 @@ type MetricsSnapshot struct {
 var lastMetrics MetricsSnapshot
 var metricsMutex sync.Mutex
 
+var avroSchema = `{
+  "type": "record",
+  "name": "LogEntry",
+  "fields": [
+    {"name": "timestamp", "type": "string"},
+    {"name": "level", "type": "string"},
+    {"name": "message", "type": "string"},
+    {"name": "service", "type": "string"}
+  ]
+}`
+
+var avroCodec = avro.MustParse(avroSchema)
+
 const numWriters = 12
 
 var logChans [numWriters]chan LogEntry
@@ -103,6 +118,14 @@ var (
 	logFormat         string // "json" or "proto"
 )
 
+func setupFile() {
+	dataDir := "./data"
+	err := os.MkdirAll(dataDir, 0755)
+	if err != nil {
+		log.Fatalf("Failed to create data directory: %v", err)
+	}
+}
+
 func main() {
 	setupFile()
 	for i := 0; i < numWriters; i++ {
@@ -110,8 +133,7 @@ func main() {
 		go writerWorker(i)
 	}
 	go metricsLogger()
-	go startTCPServerJSON() // JSON on :3001
-	go startTCPServerProto()
+	go startTCPServerUniversal() // Universal handler on :3001
 	go startUDPServer()
 	go startHTTPServer()
 
@@ -127,16 +149,8 @@ func main() {
 	}
 }
 
-func setupFile() {
-	dataDir := "./data"
-	err := os.MkdirAll(dataDir, 0755)
-	if err != nil {
-		log.Fatalf("Failed to create data directory: %v", err)
-	}
-}
-
-// --- New: JSON TCP server on :3001 ---
-func startTCPServerJSON() {
+// --- Universal TCP server on :3001 ---
+func startTCPServerUniversal() {
 	cert, err := tls.LoadX509KeyPair("./certs/cert.pem", "./certs/key.pem")
 	if err != nil {
 		log.Fatalf("Failed to load TLS certs: %v", err)
@@ -147,7 +161,7 @@ func startTCPServerJSON() {
 	if err != nil {
 		log.Fatalf("Failed to listen on TCP port 3001: %v", err)
 	}
-	log.Println("TLS TCP (JSON) log ingestor listening on :3001")
+	log.Println("TLS TCP (UNIVERSAL) log ingestor listening on :3001")
 
 	for {
 		conn, err := listener.Accept()
@@ -155,31 +169,7 @@ func startTCPServerJSON() {
 			log.Printf("TCP Accept error: %v", err)
 			continue
 		}
-		go handleConnectionJSON(conn)
-	}
-}
-
-// --- New: Proto TCP server on :3003 ---
-func startTCPServerProto() {
-	cert, err := tls.LoadX509KeyPair("./certs/cert.pem", "./certs/key.pem")
-	if err != nil {
-		log.Fatalf("Failed to load TLS certs: %v", err)
-	}
-	config := &tls.Config{Certificates: []tls.Certificate{cert}}
-
-	listener, err := tls.Listen("tcp", ":3003", config)
-	if err != nil {
-		log.Fatalf("Failed to listen on TCP port 3003: %v", err)
-	}
-	log.Println("TLS TCP (PROTOBUF) log ingestor listening on :3003")
-
-	for {
-		conn, err := listener.Accept()
-		if err != nil {
-			log.Printf("TCP Accept error: %v", err)
-			continue
-		}
-		go handleConnectionProto(conn)
+		go handleUniversalConnection(conn)
 	}
 }
 
@@ -225,44 +215,20 @@ func startUDPServer() {
 	}
 }
 
-// --- Handler for JSON ---
-func handleConnectionJSON(conn net.Conn) {
-	defer conn.Close()
-	scanner := bufio.NewScanner(conn)
-	for scanner.Scan() {
-		start := time.Now()
-		var entry LogEntry
-		line := scanner.Bytes()
-		if err := json.Unmarshal(line, &entry); err != nil {
-			log.Printf("Invalid TCP JSON log format: %v", err)
-			continue
-		}
-		if err := entry.Validate(); err != nil {
-			log.Printf("Invalid log entry: %v", err)
-			continue
-		}
-		enqueueLog(entry)
-		recordLatency(time.Since(start))
-	}
-	if err := scanner.Err(); err != nil {
-		log.Printf("TCP scanner error: %v", err)
-	}
-}
-
-// --- Handler for Proto ---
-func handleConnectionProto(conn net.Conn) {
+// --- Handler for Avro ---
+func handleConnectionAvro(conn net.Conn) {
 	defer conn.Close()
 	buf := make([]byte, 0, 64*1024)
 	tmp := make([]byte, 64*1024)
 	for {
-		// Always try to parse as many messages as possible
+		// Parse as many messages as possible from buffer
 		for {
 			if len(buf) < 4 {
 				break
 			}
 			msgLen := binary.BigEndian.Uint32(buf[:4])
 			if msgLen == 0 || msgLen > 10*1024 {
-				log.Printf("Invalid proto message length: %d", msgLen)
+				log.Printf("Invalid avro message length: %d", msgLen)
 				return
 			}
 			if len(buf) < int(4+msgLen) {
@@ -270,17 +236,17 @@ func handleConnectionProto(conn net.Conn) {
 			}
 			start := time.Now()
 			msgBuf := buf[4 : 4+msgLen]
-			var pbEntry logpb.LogEntry
-			if err := proto.Unmarshal(msgBuf, &pbEntry); err != nil {
-				log.Printf("Invalid TCP proto log format: %v", err)
+			var avroMap map[string]interface{}
+			if err := avro.Unmarshal(avroCodec, msgBuf, &avroMap); err != nil {
+				log.Printf("Invalid TCP avro log format: %v", err)
 				buf = buf[4+msgLen:]
 				continue
 			}
 			entry := LogEntry{
-				Timestamp: pbEntry.Timestamp,
-				Level:     pbEntry.Level,
-				Message:   pbEntry.Message,
-				Service:   pbEntry.Service,
+				Timestamp: toString(avroMap["timestamp"]),
+				Level:     toString(avroMap["level"]),
+				Message:   toString(avroMap["message"]),
+				Service:   toString(avroMap["service"]),
 			}
 			if err := entry.Validate(); err != nil {
 				log.Printf("Invalid log entry: %v", err)
@@ -297,6 +263,123 @@ func handleConnectionProto(conn net.Conn) {
 			return
 		}
 		buf = append(buf, tmp[:n]...)
+	}
+}
+
+// Helper to safely convert interface{} to string
+func toString(v interface{}) string {
+	if v == nil {
+		return ""
+	}
+	switch s := v.(type) {
+	case string:
+		return s
+	default:
+		return fmt.Sprintf("%v", s)
+	}
+}
+
+// --- Universal Handler ---
+func handleUniversalConnection(conn net.Conn) {
+	defer conn.Close()
+	buf := make([]byte, 0, 64*1024)
+	tmp := make([]byte, 64*1024)
+	for {
+		// Read header + length
+		for len(buf) < 5 {
+			n, err := conn.Read(tmp)
+			if err != nil {
+				return
+			}
+			buf = append(buf, tmp[:n]...)
+		}
+		format := buf[0]
+		msgLen := binary.BigEndian.Uint32(buf[1:5])
+		if msgLen == 0 || msgLen > 10*1024 {
+			log.Printf("Invalid message length: %d", msgLen)
+			return
+		}
+		for len(buf) < int(5+msgLen) {
+			n, err := conn.Read(tmp)
+			if err != nil {
+				return
+			}
+			buf = append(buf, tmp[:n]...)
+		}
+		msgBuf := buf[5 : 5+msgLen]
+		var entry LogEntry
+		var err error
+		start := time.Now()
+
+		switch format {
+		case 0x01: // JSON
+			err = json.Unmarshal(msgBuf, &entry)
+		case 0x02: // Protobuf
+			var pbEntry logpb.LogEntry
+			err = proto.Unmarshal(msgBuf, &pbEntry)
+			if err == nil {
+				entry = LogEntry{
+					Timestamp: pbEntry.Timestamp,
+					Level:     pbEntry.Level,
+					Message:   pbEntry.Message,
+					Service:   pbEntry.Service,
+				}
+			}
+		case 0x03: // Avro
+			var avroMap map[string]interface{}
+			err = avro.Unmarshal(avroCodec, msgBuf, &avroMap)
+			if err == nil {
+				entry = LogEntry{
+					Timestamp: toString(avroMap["timestamp"]),
+					Level:     toString(avroMap["level"]),
+					Message:   toString(avroMap["message"]),
+					Service:   toString(avroMap["service"]),
+				}
+			}
+		case 0x04: // Raw text (simple fallback)
+			entry = parseRawLog(string(msgBuf))
+		default:
+			log.Printf("Unknown log format: %d", format)
+			buf = buf[5+msgLen:]
+			continue
+		}
+		if err != nil {
+			log.Printf("Failed to parse log: %v", err)
+			buf = buf[5+msgLen:]
+			continue
+		}
+		if err := entry.Validate(); err != nil {
+			log.Printf("Invalid log entry: %v", err)
+			buf = buf[5+msgLen:]
+			continue
+		}
+		enqueueLog(entry)
+		recordLatency(time.Since(start))
+		buf = buf[5+msgLen:]
+	}
+}
+
+func parseRawLog(line string) LogEntry {
+	// Example: 2025-06-30T12:34:56Z [INFO] [auth] User login successful
+	var ts, level, service, msg string
+	parts := strings.SplitN(line, " ", 4)
+	if len(parts) == 4 {
+		ts = parts[0]
+		level = strings.Trim(parts[1], "[]")
+		service = strings.Trim(parts[2], "[]")
+		msg = parts[3]
+	} else {
+		// fallback to defaults if parsing fails
+		ts = time.Now().UTC().Format(time.RFC3339)
+		level = "INFO"
+		service = "raw"
+		msg = line
+	}
+	return LogEntry{
+		Timestamp: ts,
+		Level:     level,
+		Service:   service,
+		Message:   msg,
 	}
 }
 

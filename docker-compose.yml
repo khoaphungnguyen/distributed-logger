@@ -10,18 +10,7 @@ services:
   go-client-1:
     build:
       context: ./src/services/go-client
-    command:
-      [
-        "./go-client",
-        "--batch",
-        "5000",
-        "--interval",
-        "10",
-        "--format",
-        "proto",
-        "--tcp-port",
-        "3003",
-      ]
+    command: ["./go-client", "--batch", "2500", "--interval", "10"]
     depends_on:
       - go-ingestor
 
@@ -32,13 +21,25 @@ services:
       [
         "./go-client",
         "--batch",
-        "5000",
+        "2500",
         "--interval",
         "10",
         "--format",
         "proto",
-        "--tcp-port",
-        "3003",
       ]
+    depends_on:
+      - go-ingestor
+  go-client-3:
+    build:
+      context: ./src/services/go-client
+    command:
+      ["./go-client", "--batch", "2500", "--interval", "10", "--format", "avro"]
+    depends_on:
+      - go-ingestor
+  go-client-4:
+    build:
+      context: ./src/services/go-client
+    command:
+      ["./go-client", "--batch", "2500", "--interval", "10", "--format", "raw"]
     depends_on:
       - go-ingestor
