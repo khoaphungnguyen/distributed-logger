@@ -8,7 +8,7 @@ WORKDIR /app
 COPY . .
 
 # Build the Go App
-RUN go build -o tcp-ingestor main.go
+RUN go build -o go-ingestor main.go
 
 # Run the TCP server
-CMD ["./tcp-ingestor"]
+CMD ["./go-ingestor"]

@@ -25,6 +25,27 @@
         font-size: 1.2rem;
         margin: 0.5rem 0;
       }
+      .formats {
+        background: #fffbe6;
+        padding: 1rem;
+        margin: 1rem auto;
+        max-width: 500px;
+        border-radius: 8px;
+        box-shadow: 0 2px 6px rgba(255, 200, 0, 0.08);
+      }
+      .formats h2 {
+        font-size: 1.1rem;
+        margin-bottom: 0.5rem;
+      }
+      .formats ul {
+        list-style: none;
+        padding: 0;
+        margin: 0;
+      }
+      .formats li {
+        font-size: 1.1rem;
+        margin: 0.2rem 0;
+      }
     </style>
   </head>
   <body>
@@ -37,7 +58,16 @@
       <p><strong>File Rotations:</strong> <span id="fileRot">...</span></p>
       <p><strong>Dropped Logs:</strong> <span id="dropped">...</span></p>
     </div>
-
+    <div class="formats">
+      <h2>Logs by Format</h2>
+      <ul id="formatStats">
+        <li>Loading...</li>
+      </ul>
+    </div>
+    <div class="samples">
+      <h2>Sample Logs</h2>
+      <div id="sampleLogs"></div>
+    </div>
     <script>
       async function fetchMetrics() {
         try {
@@ -51,6 +81,64 @@
           document.getElementById("queueLen").textContent = data.queue_length;
           document.getElementById("fileRot").textContent = data.file_rotations;
           document.getElementById("dropped").textContent = data.dropped;
+
+          // Show per-format stats
+          const formatStats = document.getElementById("formatStats");
+          formatStats.innerHTML = "";
+          const knownFormats = [
+            "json",
+            "proto",
+            "avro",
+            "raw",
+            "syslog",
+            "journald",
+          ];
+          let found = false;
+          knownFormats.forEach((fmt) => {
+            if (data[fmt] !== undefined) {
+              found = true;
+              formatStats.innerHTML += `<li><strong>${fmt}:</strong> ${data[fmt]}</li>`;
+            }
+          });
+          // Show any other formats dynamically
+          for (const k in data) {
+            if (
+              ![
+                "logs_per_sec",
+                "mb_per_sec",
+                "latency_us",
+                "queue_length",
+                "file_rotations",
+                "dropped",
+              ].includes(k) &&
+              !knownFormats.includes(k)
+            ) {
+              found = true;
+              formatStats.innerHTML += `<li><strong>${k}:</strong> ${data[k]}</li>`;
+            }
+          }
+          if (!found) {
+            formatStats.innerHTML = "<li>No format stats available.</li>";
+          }
+
+          // Show sample logs
+          const sampleDiv = document.getElementById("sampleLogs");
+          sampleDiv.innerHTML = "";
+          if (data.samples) {
+            for (const fmt in data.samples) {
+              if (data.samples[fmt].length > 0) {
+                sampleDiv.innerHTML += `<h3>${fmt}</h3><pre>${data.samples[fmt]
+                  .map((s) => {
+                    try {
+                      return JSON.stringify(JSON.parse(s), null, 2);
+                    } catch {
+                      return s;
+                    }
+                  })
+                  .join("\n\n")}</pre>`;
+              }
+            }
+          }
         } catch (err) {
           console.error("Failed to fetch metrics:", err);
         }

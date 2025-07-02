@@ -68,15 +68,15 @@ We're building a distributed system for processing log data at scale. This repos
 
 You can pass flags to the Go client container to configure its behavior:
 
-| Flag         | Description                              | Default       |
-| ------------ | ---------------------------------------- | ------------- |
-| `--batch`    | Number of logs to send per batch         | `100`         |
-| `--interval` | Interval in milliseconds between batches | `1000`        |
-| `--address`  | Ingestor host address                    | `go-ingestor` |
-| `--tcp-port` | TCP port for ingestion                   | `3001`        |
-| `--udp-port` | UDP port for ingestion                   | `3002`        |
-| `--udp`      | Use UDP instead of TCP                   | `false`       |
-| `--format`   | Log format: `json`, `proto`, `avro`, or `raw` | `json`   |
+| Flag         | Description                                   | Default       |
+| ------------ | --------------------------------------------- | ------------- |
+| `--batch`    | Number of logs to send per batch              | `100`         |
+| `--interval` | Interval in milliseconds between batches      | `1000`        |
+| `--address`  | Ingestor host address                         | `go-ingestor` |
+| `--tcp-port` | TCP port for ingestion                        | `3001`        |
+| `--udp-port` | UDP port for ingestion                        | `3002`        |
+| `--udp`      | Use UDP instead of TCP                        | `false`       |
+| `--format`   | Log format: `json`, `proto`, `avro`, or `raw` | `json`        |
 
 **Universal handler (default for TCP):**
 
@@ -237,7 +237,6 @@ Compressed log files are written to:
 - 🛠️ **Unified ingestion pipeline:** No more separate ports for different formats—universal handler simplifies deployment and scaling.
 - 🌐 **Validated at scale:** Multiple clients sending mixed formats concurrently, all ingested and normalized with accurate metrics and robust performance.
 
-
 ### 🚀 Day 13 Milestones
 
 - 🗄️ **Schema Registry Service:** Added a dedicated schema registry microservice.
@@ -245,3 +244,12 @@ Compressed log files are written to:
 - 🔄 **Dynamic schema fetching:** Both client and ingestor now fetch schemas from the registry at startup, enabling easy schema evolution and multi-type support.
 - 🛡️ **End-to-end schema validation:** Both client and server validate logs against the latest schema from the registry, ensuring data integrity and compatibility.
 - 🧩 **Extensible architecture:** System now supports registering and using multiple log types and schema versions, paving the way for future extensibility.
+
+## 🚀 Day 14 Milestones
+
+- 🕵️ **Format detection engine:** Refined and hardened the automatic detection of incoming log formats in the ingestion pipeline. Now robustly distinguishes between syslog, journald, and custom raw log lines, eliminating accidental misclassification (e.g., JSON detected as raw).
+- 🔌 **Syslog & journald adapters:** Improved adapters to parse real-world syslog and journald log lines using regex and field extraction, mapping all standard syslog/journald levels and timestamps to the normalized `LogEntry` struct.
+- 🔄 **Universal handler integration:** Enhanced the universal handler to seamlessly ingest syslog, journald, and raw formats alongside JSON, Avro, and Protobuf, with accurate format routing and parsing.
+- 🛡️ **Schema validation for new formats:** Extended schema validation to cover logs ingested via syslog and journald, ensuring all data conforms to the unified schema and preventing ingestion of incomplete or malformed entries.
+- 📤 **Flexible output options:** Continued support for exporting logs in structured text and CSV formats, in addition to JSONL and compressed outputs.
+- 📊 **Dashboard enhancements:** Updated the web dashboard and `/metrics` endpoint to display live statistics and sample entries per log format, providing deeper operational insights and real-time visibility into ingested data.

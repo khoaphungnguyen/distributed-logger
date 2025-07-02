@@ -8,6 +8,7 @@ services:
   go-ingestor:
     build:
       context: ./src/services/go-ingestor
+    command: ["./go-ingestor"]
     ports:
       - "3000:3000"
     depends_on:
@@ -16,7 +17,7 @@ services:
   go-client-1:
     build:
       context: ./src/services/go-client
-    command: ["./go-client", "--batch", "2500", "--interval", "10"]
+    command: ["./go-client", "--batch", "4000", "--interval", "10"]
     depends_on:
       - go-ingestor
 
@@ -27,7 +28,7 @@ services:
       [
         "./go-client",
         "--batch",
-        "2500",
+        "4000",
         "--interval",
         "10",
         "--format",
@@ -40,7 +41,7 @@ services:
     build:
       context: ./src/services/go-client
     command:
-      ["./go-client", "--batch", "2500", "--interval", "10", "--format", "arvo"]
+      ["./go-client", "--batch", "4000", "--interval", "10", "--format", "avro"]
     depends_on:
       - go-ingestor
 
@@ -48,6 +49,6 @@ services:
     build:
       context: ./src/services/go-client
     command:
-      ["./go-client", "--batch", "2500", "--interval", "10", "--format", "raw"]
+      ["./go-client", "--batch", "4000", "--interval", "10", "--format", "raw"]
     depends_on:
       - go-ingestor

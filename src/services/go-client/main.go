@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -57,6 +58,9 @@ var messages = []string{
 	"Order created",
 	"Resource not found",
 }
+
+var syslogLevels = []string{"emerg", "alert", "crit", "err", "warning", "notice", "info", "debug"}
+var journaldPriorities = []int{0, 1, 2, 3, 4, 5, 6, 7}
 
 // --- Dynamic schema fetching ---
 type SchemaInfo struct {
@@ -311,9 +315,8 @@ loop:
 						codec, _ := avro.Parse(avroSchemaStr)
 						b, err = avro.Marshal(codec, avroMap)
 					case "raw":
-						entry := randomLog()
-						rawLine := entry.Timestamp + " [" + entry.Level + "] [" + entry.Service + "] " + entry.Message
-						b = []byte(rawLine)
+						b, _ = randomAnyLog()
+						// log.Printf("Generated random log of type: %s", typ)
 					default:
 						entry := randomLog()
 						b, err = json.Marshal(entry)
@@ -366,6 +369,51 @@ loop:
 		}
 	}
 	log.Printf("Final stats: Sent batches: %d, Failed batches: %d", sentBatches, failedBatches)
+}
+
+// Returns a random log as a []byte and a string describing the type ("logentry", "syslog", "journald")
+func randomAnyLog() ([]byte, string) {
+	entry := randomLog()
+	r := rand.Intn(3)
+	switch r {
+	case 0:
+		rawLine := fmt.Sprintf("%s [%s] [%s] %s", entry.Timestamp, entry.Level, entry.Service, entry.Message)
+		return []byte(rawLine), "logentry"
+	case 1:
+		// Syslog: "Jul  2 17:00:01 host service[pid]: message" (with level as prefix)
+		level := syslogLevels[rand.Intn(len(syslogLevels))]
+		now := time.Now()
+		host := "host"
+		pid := rand.Intn(10000)
+		line := fmt.Sprintf("%s %s %s[%d]: %s", now.Format("Jan  2 15:04:05"), host, entry.Service, pid, entry.Message)
+		// Prepend level in a way some syslog daemons do: "<level>"
+		line = fmt.Sprintf("<%d>%s", indexOfSyslogLevel(level), line)
+		return []byte(line), "syslog"
+	case 2:
+		// Journald: JSON with PRIORITY and MESSAGE fields
+		priority := journaldPriorities[rand.Intn(len(journaldPriorities))]
+		journal := map[string]interface{}{
+			"__REALTIME_TIMESTAMP": time.Now().UnixNano() / 1000,
+			"_HOSTNAME":            "host",
+			"PRIORITY":             strconv.Itoa(priority),
+			"_SYSTEMD_UNIT":        entry.Service + ".service",
+			"MESSAGE":              entry.Message,
+		}
+		b, _ := json.Marshal(journal)
+		return b, "journald"
+	default:
+		b, _ := json.Marshal(entry)
+		return b, "logentry"
+	}
+}
+
+func indexOfSyslogLevel(level string) int {
+	for i, l := range syslogLevels {
+		if l == level {
+			return i
+		}
+	}
+	return 6 // info
 }
 
 // Split batch into slices of strings, each joined chunk <= maxBytes

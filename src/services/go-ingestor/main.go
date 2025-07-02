@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"encoding/binary"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"hash/crc32"
 	"io/ioutil"
@@ -15,7 +16,9 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -49,7 +52,10 @@ func (e *LogEntry) Validate() error {
 	if e.Level == "" {
 		return fmt.Errorf("missing level")
 	}
-	allowedLevels := map[string]bool{"INFO": true, "WARN": true, "ERROR": true, "DEBUG": true}
+	allowedLevels := map[string]bool{
+		"INFO": true, "WARN": true, "WARNING": true, "ERROR": true, "DEBUG": true,
+		"EMERG": true, "ALERT": true, "CRIT": true, "ERR": true, "NOTICE": true,
+	}
 	if !allowedLevels[e.Level] {
 		return fmt.Errorf("invalid level: %s", e.Level)
 	}
@@ -76,7 +82,21 @@ type MetricsSnapshot struct {
 	QueueLength   int64
 	FileRotations int32
 	Dropped       int64
+	FormatCounts  map[string]int64
 }
+
+var (
+	sampleMutex sync.Mutex
+	sampleLogs  = map[string][]string{
+		"json":     {},
+		"proto":    {},
+		"avro":     {},
+		"raw":      {},
+		"syslog":   {},
+		"journald": {},
+	}
+	sampleLimit = 3 // Number of samples to keep per format
+)
 
 var (
 	lastMetrics       MetricsSnapshot
@@ -90,6 +110,14 @@ var (
 	fileRotationCount int32
 	droppedLogs       int64
 	rateTicker        = time.NewTicker(1 * time.Second)
+	formatCounts      = map[string]*int64{
+		"json":     new(int64),
+		"proto":    new(int64),
+		"avro":     new(int64),
+		"raw":      new(int64),
+		"syslog":   new(int64),
+		"journald": new(int64),
+	}
 )
 
 // --- Schema Registry Integration ---
@@ -163,6 +191,7 @@ var (
 	zstdWriters  [numWriters]*zstd.Encoder
 	writerLocks  [numWriters]sync.Mutex
 	rotationSize = int64(50 * 1024 * 1024) // 50MB
+	outputFormat string
 )
 
 func setupFile() {
@@ -176,7 +205,7 @@ func setupFile() {
 func rotateLogFile(idx int) {
 	closeLogFile(idx)
 	timestamp := time.Now().Format("20060102_150405")
-	filePath := filepath.Join("./data", fmt.Sprintf("log_%d_%s.jsonl.zst", idx, timestamp))
+	filePath := filepath.Join("./data", fmt.Sprintf("log_%d_%s.%s.zst", idx, timestamp, outputFormat))
 	f, err := os.Create(filePath)
 	if err != nil {
 		log.Fatalf("Failed to create log file: %v", err)
@@ -219,9 +248,18 @@ func flushLogs(idx int, logs []LogEntry) {
 	defer writerLocks[idx].Unlock()
 	rotateIfNeeded(idx)
 	for _, entry := range logs {
-		line, _ := json.Marshal(entry)
-		zstdWriters[idx].Write([]byte(string(line) + "\n"))
-		atomic.AddInt64(&totalBytes, int64(len(line)+1))
+		var line string
+		switch outputFormat {
+		case "csv":
+			line = fmt.Sprintf("%q,%q,%q,%q\n", entry.Timestamp, entry.Level, entry.Service, entry.Message)
+		case "text":
+			line = fmt.Sprintf("%s [%s] [%s] %s\n", entry.Timestamp, entry.Level, entry.Service, entry.Message)
+		default: // jsonl
+			b, _ := json.Marshal(entry)
+			line = string(b) + "\n"
+		}
+		zstdWriters[idx].Write([]byte(line))
+		atomic.AddInt64(&totalBytes, int64(len(line)))
 	}
 	zstdWriters[idx].Flush()
 }
@@ -296,6 +334,11 @@ func metricsLogger() {
 		}
 		numGoroutines := runtime.NumGoroutine()
 
+		formatSnapshot := make(map[string]int64)
+		for k, v := range formatCounts {
+			formatSnapshot[k] = atomic.LoadInt64(v)
+		}
+
 		lastMetrics = MetricsSnapshot{
 			LogsPerSec:    rate,
 			MBPerSec:      float64(bytesPerSec) / (1024 * 1024),
@@ -303,6 +346,7 @@ func metricsLogger() {
 			QueueLength:   queueLen,
 			FileRotations: rotations,
 			Dropped:       dropped,
+			FormatCounts:  formatSnapshot,
 		}
 
 		atomic.StoreInt64(&processCount, 0)
@@ -320,8 +364,8 @@ func metricsLogger() {
 			}
 		}
 
-		log.Printf("[METRIC] Logs/sec: %d, MB/s: %.2f, Latency: %.2fµs, Queue: %d (max: %d), Rotations: %d, Goroutines: %d, FileSize: %.2fMB, Dropped: %d",
-			rate, float64(bytesPerSec)/(1024*1024), avgLatency, queueLen, maxQueue, rotations, numGoroutines, float64(totalFileSize)/(1024*1024), dropped)
+		log.Printf("[METRIC] Logs/sec: %d, MB/s: %.2f, Latency: %.2fµs, Queue: %d (max: %d), Rotations: %d, Goroutines: %d, FileSize: %.2fMB, Dropped: %d, Formats: %+v",
+			rate, float64(bytesPerSec)/(1024*1024), avgLatency, queueLen, maxQueue, rotations, numGoroutines, float64(totalFileSize)/(1024*1024), dropped, formatSnapshot)
 		metricsMutex.Unlock()
 	}
 }
@@ -331,6 +375,18 @@ func recordLatency(d time.Duration) {
 	atomic.AddInt64(&latencyCount, 1)
 }
 
+func recordSample(format string, entry LogEntry) {
+	sampleMutex.Lock()
+	defer sampleMutex.Unlock()
+	b, _ := json.Marshal(entry)
+	lines := sampleLogs[format]
+	lines = append(lines, string(b))
+	if len(lines) > sampleLimit {
+		lines = lines[len(lines)-sampleLimit:]
+	}
+	sampleLogs[format] = lines
+}
+
 // --- HTTP Dashboard ---
 func startHTTPServer() {
 	http.Handle("/", http.FileServer(http.Dir("./static")))
@@ -338,7 +394,9 @@ func startHTTPServer() {
 		metricsMutex.Lock()
 		snap := lastMetrics
 		metricsMutex.Unlock()
-		fmt.Fprintf(w, `{"logs_per_sec": %d, "mb_per_sec": %.2f, "latency_us": %.2f, "queue_length": %d, "file_rotations": %d, "dropped": %d}`,
+		sampleMutex.Lock()
+		defer sampleMutex.Unlock()
+		fmt.Fprintf(w, `{"logs_per_sec": %d, "mb_per_sec": %.2f, "latency_us": %.2f, "queue_length": %d, "file_rotations": %d, "dropped": %d`,
 			snap.LogsPerSec,
 			snap.MBPerSec,
 			snap.LatencyUs,
@@ -346,6 +404,27 @@ func startHTTPServer() {
 			snap.FileRotations,
 			snap.Dropped,
 		)
+		for k, v := range snap.FormatCounts {
+			fmt.Fprintf(w, `,"%s":%d`, k, v)
+		}
+		// Add samples
+		fmt.Fprintf(w, `,"samples":{`)
+		first := true
+		for k, v := range sampleLogs {
+			if !first {
+				fmt.Fprint(w, ",")
+			}
+			first = false
+			fmt.Fprintf(w, `"%s":[`, k)
+			for i, s := range v {
+				if i > 0 {
+					fmt.Fprint(w, ",")
+				}
+				fmt.Fprintf(w, "%q", s)
+			}
+			fmt.Fprint(w, "]")
+		}
+		fmt.Fprint(w, "}}")
 	})
 	log.Println("Dashboard available at http://localhost:3000")
 	http.ListenAndServe(":3000", nil)
@@ -405,11 +484,14 @@ func startUDPServer() {
 				continue
 			}
 			if err := entry.Validate(); err != nil {
+				log.Printf("entry %v", entry)
 				log.Printf("Invalid log entry: %v", err)
 				continue
 			}
+			recordSample("json", entry)
 			enqueueLog(entry)
 			recordLatency(time.Since(start))
+			incrementFormatCount("json")
 		}
 		if err := scanner.Err(); err != nil {
 			log.Printf("UDP scanner error: %v", err)
@@ -448,9 +530,11 @@ func handleUniversalConnection(conn net.Conn) {
 		var entry LogEntry
 		var err error
 		start := time.Now()
+		formatType := ""
 
 		switch format {
 		case 0x01: // JSON
+			formatType = "json"
 			err = json.Unmarshal(msgBuf, &entry)
 			if err == nil && jsonSchema != nil {
 				result, err2 := jsonSchema.Validate(gojsonschema.NewBytesLoader(msgBuf))
@@ -460,6 +544,7 @@ func handleUniversalConnection(conn net.Conn) {
 				}
 			}
 		case 0x02: // Protobuf
+			formatType = "proto"
 			if protoMsgDesc != nil {
 				pbEntry := dynamicpb.NewMessage(protoMsgDesc)
 				err = proto.Unmarshal(msgBuf, pbEntry)
@@ -475,6 +560,7 @@ func handleUniversalConnection(conn net.Conn) {
 				err = fmt.Errorf("proto descriptor not loaded")
 			}
 		case 0x03: // Avro
+			formatType = "avro"
 			if avroCodec != nil {
 				var avroMap map[string]interface{}
 				err = avro.Unmarshal(avroCodec, msgBuf, &avroMap)
@@ -490,7 +576,15 @@ func handleUniversalConnection(conn net.Conn) {
 				err = fmt.Errorf("avro schema not loaded")
 			}
 		case 0x04: // Raw text
-			entry = parseRawLog(string(msgBuf))
+			formatType = detectLogFormat(string(msgBuf))
+			switch formatType {
+			case "syslog":
+				entry = parseSyslog(string(msgBuf))
+			case "journald":
+				entry = parseJournald(string(msgBuf))
+			default:
+				entry = parseRawLog(string(msgBuf))
+			}
 		default:
 			log.Printf("Unknown log format: %d", format)
 			buf = buf[5+msgLen:]
@@ -502,13 +596,22 @@ func handleUniversalConnection(conn net.Conn) {
 			continue
 		}
 		if err := entry.Validate(); err != nil {
+			log.Printf("entry before validation: %+v", entry)
 			log.Printf("Invalid log entry: %v", err)
 			buf = buf[5+msgLen:]
 			continue
 		}
+		recordSample(formatType, entry)
 		enqueueLog(entry)
 		recordLatency(time.Since(start))
+		incrementFormatCount(formatType)
 		buf = buf[5+msgLen:]
+	}
+}
+
+func incrementFormatCount(format string) {
+	if c, ok := formatCounts[format]; ok {
+		atomic.AddInt64(c, 1)
 	}
 }
 
@@ -535,6 +638,8 @@ func parseRawLog(line string) LogEntry {
 		service = strings.Trim(parts[2], "[]")
 		msg = parts[3]
 	} else {
+		// Try to parse as just a message, fallback to now
+		log.Printf("parseRawLog: unexpected format: %q", line)
 		ts = time.Now().UTC().Format(time.RFC3339)
 		level = "INFO"
 		service = "raw"
@@ -548,8 +653,137 @@ func parseRawLog(line string) LogEntry {
 	}
 }
 
+func detectLogFormat(line string) string {
+	if strings.Contains(line, "journal") || strings.Contains(line, "_SYSTEMD_UNIT") {
+		return "journald"
+	}
+	// Syslog: starts with <PRI>Mon ... (e.g., <6>Jul  2 17:00:01 ...)
+	if len(line) > 5 && line[0] == '<' {
+		for i := 1; i < len(line) && i < 5; i++ {
+			if line[i] == '>' && i > 1 {
+				// Looks like <number>
+				months := []string{"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"}
+				for _, m := range months {
+					if strings.HasPrefix(line[i+1:], m) {
+						return "syslog"
+					}
+				}
+			}
+		}
+	}
+	return "raw"
+}
+
+var syslogRegex = regexp.MustCompile(`^<(\d+)>([A-Z][a-z]{2}\s+\d+\s+\d{2}:\d{2}:\d{2})\s+(\S+)\s+(\S+)\[(\d+)\]:\s+(.*)$`)
+var journaldRegex = regexp.MustCompile(`"PRIORITY"\s*:\s*"(\d+)"`)
+
+func parseSyslog(line string) LogEntry {
+	// Example: <6>Jul  2 17:00:01 host service[1234]: message
+	m := syslogRegex.FindStringSubmatch(line)
+	ts := time.Now().UTC().Format(time.RFC3339)
+	level := "INFO"
+	service := "syslog"
+	msg := line
+	if len(m) == 7 {
+		pri, _ := strconv.Atoi(m[1])
+		level = syslogLevelFromPRI(pri)
+		parsedTs := parseSyslogTimestamp(m[2])
+		if parsedTs != "" {
+			ts = parsedTs
+		}
+		service = m[4]
+		msg = m[6]
+	} else {
+		log.Printf("Syslog regex did not match: %q", line)
+	}
+	return LogEntry{
+		Timestamp: ts,
+		Level:     level,
+		Service:   service,
+		Message:   msg,
+	}
+}
+func parseSyslogTimestamp(ts string) string {
+	// Parse "Jul  2 17:00:01" to RFC3339 using current year
+	year := time.Now().Year()
+	parsed, err := time.Parse("Jan 2 15:04:05", ts)
+	if err != nil {
+		parsed, err = time.Parse("Jan  2 15:04:05", ts) // handle double space
+		if err != nil {
+			return ""
+		}
+	}
+	parsed = parsed.AddDate(year-parsed.Year(), 0, 0)
+	return parsed.Format(time.RFC3339)
+}
+
+func syslogLevelFromPRI(pri int) string {
+	levels := []string{"EMERG", "ALERT", "CRIT", "ERR", "WARNING", "NOTICE", "INFO", "DEBUG"}
+	if pri >= 0 && pri < len(levels) {
+		return levels[pri]
+	}
+	return "INFO"
+}
+
+func parseJournald(line string) LogEntry {
+	// Try to parse JSON
+	var m map[string]interface{}
+	_ = json.Unmarshal([]byte(line), &m)
+	ts := time.Now().UTC().Format(time.RFC3339)
+	level := "INFO"
+	service := "journald"
+	msg := line
+	if v, ok := m["PRIORITY"]; ok {
+		level = syslogLevelFromPRI(parsePriority(v))
+	}
+	if v, ok := m["_SYSTEMD_UNIT"]; ok {
+		service = fmt.Sprintf("%v", v)
+	}
+	if v, ok := m["MESSAGE"]; ok {
+		msg = fmt.Sprintf("%v", v)
+	}
+	if v, ok := m["__REALTIME_TIMESTAMP"]; ok {
+		ts = parseJournaldTimestamp(v)
+	}
+	return LogEntry{
+		Timestamp: ts,
+		Level:     level,
+		Service:   service,
+		Message:   msg,
+	}
+}
+
+func parsePriority(v interface{}) int {
+	switch vv := v.(type) {
+	case string:
+		i, _ := strconv.Atoi(vv)
+		return i
+	case float64:
+		return int(vv)
+	default:
+		return 6 // info
+	}
+}
+
+func parseJournaldTimestamp(v interface{}) string {
+	switch vv := v.(type) {
+	case string:
+		i, _ := strconv.ParseInt(vv, 10, 64)
+		return time.Unix(0, i*1000).Format(time.RFC3339)
+	case float64:
+		return time.Unix(0, int64(vv)*1000).Format(time.RFC3339)
+	default:
+		return time.Now().UTC().Format(time.RFC3339)
+	}
+}
+
 // --- Main ---
 func main() {
+	var outFmt string
+	flag.StringVar(&outFmt, "out", "jsonl", "Output format: jsonl, csv, or text")
+	flag.Parse()
+	outputFormat = outFmt
+
 	setupFile()
 	fetchAndCacheSchemas()
 	for i := 0; i < numWriters; i++ {
