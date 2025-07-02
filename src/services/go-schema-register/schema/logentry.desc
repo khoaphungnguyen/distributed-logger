@@ -1,0 +1,8 @@
+
+³
+logentry.protolog"r
+LogEntry
+	timestamp (	R	timestamp
+level (	Rlevel
+message (	Rmessage
+service (	RserviceB Zdistributed-logger/proto;logpbbproto3

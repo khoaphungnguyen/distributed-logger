@@ -1,11 +1,17 @@
 services:
+  go-schema-register:
+    build:
+      context: ./src/services/go-schema-register
+    ports:
+      - "8000:8000"
+
   go-ingestor:
     build:
       context: ./src/services/go-ingestor
-    #volumes:
-    #- ./data/:/app/data
     ports:
       - "3000:3000"
+    depends_on:
+      - go-schema-register
 
   go-client-1:
     build:
@@ -29,13 +35,15 @@ services:
       ]
     depends_on:
       - go-ingestor
+
   go-client-3:
     build:
       context: ./src/services/go-client
     command:
-      ["./go-client", "--batch", "2500", "--interval", "10", "--format", "avro"]
+      ["./go-client", "--batch", "2500", "--interval", "10", "--format", "arvo"]
     depends_on:
       - go-ingestor
+
   go-client-4:
     build:
       context: ./src/services/go-client

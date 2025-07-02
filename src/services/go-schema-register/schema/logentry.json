@@ -1,0 +1,12 @@
+{
+  "format": "json",
+  "name": "LogEntry",
+  "type": "object",
+  "properties": {
+    "timestamp": { "type": "string" },
+    "level": { "type": "string" },
+    "message": { "type": "string" },
+    "service": { "type": "string" }
+  },
+  "required": ["timestamp", "level", "message", "service"]
+}

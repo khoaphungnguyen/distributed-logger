@@ -1,21 +1,14 @@
-// =========================
-// main.go (Go TCP + UDP Server + Web Metrics)
-// =========================
 package main
 
 import (
 	"bufio"
 	"bytes"
-	logpb "go-ingestor/proto"
-	"hash/crc32"
-	"strings"
-	"sync/atomic"
-
-	// "compress/gzip" // REMOVE this line
 	"crypto/tls"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"hash/crc32"
+	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
@@ -23,13 +16,20 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/hamba/avro/v2"
 	"github.com/klauspost/compress/zstd"
+	"github.com/xeipuuv/gojsonschema"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protodesc"
+	"google.golang.org/protobuf/reflect/protoreflect"
+	"google.golang.org/protobuf/types/descriptorpb"
+	"google.golang.org/protobuf/types/dynamicpb"
 )
 
 type LogEntry struct {
@@ -68,6 +68,7 @@ func (e *LogEntry) Validate() error {
 	return nil
 }
 
+// --- Metrics ---
 type MetricsSnapshot struct {
 	LogsPerSec    int64
 	MBPerSec      float64
@@ -77,45 +78,91 @@ type MetricsSnapshot struct {
 	Dropped       int64
 }
 
-var lastMetrics MetricsSnapshot
-var metricsMutex sync.Mutex
-
-var avroSchema = `{
-  "type": "record",
-  "name": "LogEntry",
-  "fields": [
-    {"name": "timestamp", "type": "string"},
-    {"name": "level", "type": "string"},
-    {"name": "message", "type": "string"},
-    {"name": "service", "type": "string"}
-  ]
-}`
-
-var avroCodec = avro.MustParse(avroSchema)
-
-const numWriters = 12
-
-var logChans [numWriters]chan LogEntry
-
-// Each writer has its own file and zstd writer
-var logFiles [numWriters]*os.File
-var zstdWriters [numWriters]*zstd.Encoder
-var writerLocks [numWriters]sync.Mutex
-
 var (
-	logFile           *os.File
-	mutex             sync.Mutex
+	lastMetrics       MetricsSnapshot
+	metricsMutex      sync.Mutex
 	processCount      int64
-	rotationSize      = int64(50 * 1024 * 1024) // 50MB
-	rateTicker        = time.NewTicker(1 * time.Second)
 	totalBytes        int64
 	totalLatency      int64
 	latencyCount      int64
 	queueLength       int64
-	fileRotationCount int32
 	maxQueueLength    int64
+	fileRotationCount int32
 	droppedLogs       int64
-	logFormat         string // "json" or "proto"
+	rateTicker        = time.NewTicker(1 * time.Second)
+)
+
+// --- Schema Registry Integration ---
+var (
+	jsonSchema   *gojsonschema.Schema
+	avroCodec    avro.Schema
+	protoMsgDesc protoreflect.MessageDescriptor
+)
+
+func fetchAndCacheSchemas() {
+	// JSON Schema
+	resp, err := http.Get("http://go-schema-register:8000/schema/get?format=json&name=LogEntry")
+	if err != nil {
+		log.Fatalf("Failed to fetch JSON schema: %v", err)
+	}
+	defer resp.Body.Close()
+	var result struct {
+		Schema string `json:"schema"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		log.Fatalf("Failed to decode JSON schema: %v", err)
+	}
+	jsonSchema, err = gojsonschema.NewSchema(gojsonschema.NewStringLoader(result.Schema))
+	if err != nil {
+		log.Fatalf("Failed to parse JSON schema: %v", err)
+	}
+
+	// Avro Schema
+	resp, err = http.Get("http://go-schema-register:8000/schema/get?format=avro&name=LogEntry")
+	if err != nil {
+		log.Fatalf("Failed to fetch Avro schema: %v", err)
+	}
+	defer resp.Body.Close()
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		log.Fatalf("Failed to decode Avro schema: %v", err)
+	}
+	avroCodec, err = avro.Parse(result.Schema)
+	if err != nil {
+		log.Fatalf("Failed to parse Avro schema: %v", err)
+	}
+
+	// Protobuf Descriptor
+	resp, err = http.Get("http://go-schema-register:8000/schema/descriptor?name=LogEntry")
+	if err != nil {
+		log.Fatalf("Failed to fetch proto descriptor: %v", err)
+	}
+	defer resp.Body.Close()
+	descBytes, _ := ioutil.ReadAll(resp.Body)
+	protoDesc := &descriptorpb.FileDescriptorSet{}
+	if err := proto.Unmarshal(descBytes, protoDesc); err != nil {
+		log.Fatalf("Failed to unmarshal proto descriptor: %v", err)
+	}
+	for _, fdProto := range protoDesc.File {
+		fd, err := protodesc.NewFile(fdProto, nil)
+		if err != nil {
+			continue
+		}
+		if md := fd.Messages().ByName("LogEntry"); md != nil {
+			protoMsgDesc = md
+			break
+		}
+	}
+}
+
+// --- File and Writer Management ---
+const numWriters = 12
+
+var (
+	logChans     [numWriters]chan LogEntry
+	logFiles     [numWriters]*os.File
+	zstdWriters  [numWriters]*zstd.Encoder
+	writerLocks  [numWriters]sync.Mutex
+	rotationSize = int64(50 * 1024 * 1024) // 50MB
 )
 
 func setupFile() {
@@ -126,27 +173,182 @@ func setupFile() {
 	}
 }
 
-func main() {
-	setupFile()
-	for i := 0; i < numWriters; i++ {
-		logChans[i] = make(chan LogEntry, 200000)
-		go writerWorker(i)
+func rotateLogFile(idx int) {
+	closeLogFile(idx)
+	timestamp := time.Now().Format("20060102_150405")
+	filePath := filepath.Join("./data", fmt.Sprintf("log_%d_%s.jsonl.zst", idx, timestamp))
+	f, err := os.Create(filePath)
+	if err != nil {
+		log.Fatalf("Failed to create log file: %v", err)
 	}
-	go metricsLogger()
-	go startTCPServerUniversal() // Universal handler on :3001
-	go startUDPServer()
-	go startHTTPServer()
+	logFiles[idx] = f
+	encoder, err := zstd.NewWriter(f, zstd.WithEncoderLevel(zstd.SpeedFastest))
+	if err != nil {
+		log.Fatalf("Failed to create zstd writer: %v", err)
+	}
+	zstdWriters[idx] = encoder
+	fileRotationCount++
+	log.Printf("Started new log file: %s", filePath)
+}
 
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-	<-sigChan
-	log.Println("Shutting down, flushing logs...")
-	for i := 0; i < numWriters; i++ {
-		close(logChans[i])
+func closeLogFile(idx int) {
+	if zstdWriters[idx] != nil {
+		zstdWriters[idx].Close()
 	}
-	for i := 0; i < numWriters; i++ {
-		closeLogFile(i)
+	if logFiles[idx] != nil {
+		logFiles[idx].Close()
 	}
+}
+
+func shouldRotate(idx int) bool {
+	if logFiles[idx] == nil {
+		return true
+	}
+	info, err := logFiles[idx].Stat()
+	return err != nil || info.Size() >= rotationSize
+}
+
+func rotateIfNeeded(idx int) {
+	if shouldRotate(idx) {
+		rotateLogFile(idx)
+	}
+}
+
+func flushLogs(idx int, logs []LogEntry) {
+	writerLocks[idx].Lock()
+	defer writerLocks[idx].Unlock()
+	rotateIfNeeded(idx)
+	for _, entry := range logs {
+		line, _ := json.Marshal(entry)
+		zstdWriters[idx].Write([]byte(string(line) + "\n"))
+		atomic.AddInt64(&totalBytes, int64(len(line)+1))
+	}
+	zstdWriters[idx].Flush()
+}
+
+// --- Log Processing ---
+func hash(entry LogEntry) int {
+	return int(crc32.ChecksumIEEE([]byte(entry.Timestamp+entry.Service))) % numWriters
+}
+
+func enqueueLog(entry LogEntry) {
+	idx := hash(entry)
+	select {
+	case logChans[idx] <- entry:
+		// enqueued
+	default:
+		atomic.AddInt64(&droppedLogs, 1)
+		if atomic.AddInt64(&droppedLogs, 1)%1000 == 0 {
+			log.Printf("[OVERLOAD] Log dropped! Total dropped: %d", atomic.LoadInt64(&droppedLogs))
+		}
+	}
+}
+
+func writerWorker(idx int) {
+	rotateLogFile(idx)
+	buffer := make([]LogEntry, 0, 100000)
+	flushTimer := time.NewTicker(500 * time.Millisecond)
+	defer flushTimer.Stop()
+
+	for {
+		select {
+		case entry, ok := <-logChans[idx]:
+			if !ok {
+				flushLogs(idx, buffer)
+				return
+			}
+			buffer = append(buffer, entry)
+			atomic.AddInt64(&processCount, 1)
+			atomic.StoreInt64(&queueLength, int64(len(logChans[idx])))
+			if len(buffer) >= 20000 || shouldRotate(idx) {
+				flushLogs(idx, buffer)
+				buffer = buffer[:0]
+			}
+		case <-flushTimer.C:
+			if len(buffer) > 0 {
+				flushLogs(idx, buffer)
+				buffer = buffer[:0]
+			}
+		}
+	}
+}
+
+// --- Metrics ---
+func metricsLogger() {
+	for range rateTicker.C {
+		metricsMutex.Lock()
+		rate := atomic.LoadInt64(&processCount)
+		bytesPerSec := atomic.LoadInt64(&totalBytes)
+		totalLat := atomic.LoadInt64(&totalLatency)
+		latCount := atomic.LoadInt64(&latencyCount)
+		queueLen := atomic.LoadInt64(&queueLength)
+		maxQueue := atomic.LoadInt64(&maxQueueLength)
+		rotations := atomic.LoadInt32((*int32)(&fileRotationCount))
+		dropped := atomic.LoadInt64(&droppedLogs)
+
+		avgLatency := float64(0)
+		if latCount > 0 {
+			avgLatency = float64(totalLat) / float64(latCount)
+		}
+		if queueLen > maxQueue {
+			atomic.StoreInt64(&maxQueueLength, queueLen)
+			maxQueue = queueLen
+		}
+		numGoroutines := runtime.NumGoroutine()
+
+		lastMetrics = MetricsSnapshot{
+			LogsPerSec:    rate,
+			MBPerSec:      float64(bytesPerSec) / (1024 * 1024),
+			LatencyUs:     avgLatency,
+			QueueLength:   queueLen,
+			FileRotations: rotations,
+			Dropped:       dropped,
+		}
+
+		atomic.StoreInt64(&processCount, 0)
+		atomic.StoreInt64(&totalBytes, 0)
+		atomic.StoreInt64(&totalLatency, 0)
+		atomic.StoreInt64(&latencyCount, 0)
+
+		var totalFileSize int64
+		for i := 0; i < numWriters; i++ {
+			if logFiles[i] != nil {
+				info, err := logFiles[i].Stat()
+				if err == nil {
+					totalFileSize += info.Size()
+				}
+			}
+		}
+
+		log.Printf("[METRIC] Logs/sec: %d, MB/s: %.2f, Latency: %.2fµs, Queue: %d (max: %d), Rotations: %d, Goroutines: %d, FileSize: %.2fMB, Dropped: %d",
+			rate, float64(bytesPerSec)/(1024*1024), avgLatency, queueLen, maxQueue, rotations, numGoroutines, float64(totalFileSize)/(1024*1024), dropped)
+		metricsMutex.Unlock()
+	}
+}
+
+func recordLatency(d time.Duration) {
+	atomic.AddInt64(&totalLatency, d.Microseconds())
+	atomic.AddInt64(&latencyCount, 1)
+}
+
+// --- HTTP Dashboard ---
+func startHTTPServer() {
+	http.Handle("/", http.FileServer(http.Dir("./static")))
+	http.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+		metricsMutex.Lock()
+		snap := lastMetrics
+		metricsMutex.Unlock()
+		fmt.Fprintf(w, `{"logs_per_sec": %d, "mb_per_sec": %.2f, "latency_us": %.2f, "queue_length": %d, "file_rotations": %d, "dropped": %d}`,
+			snap.LogsPerSec,
+			snap.MBPerSec,
+			snap.LatencyUs,
+			snap.QueueLength,
+			snap.FileRotations,
+			snap.Dropped,
+		)
+	})
+	log.Println("Dashboard available at http://localhost:3000")
+	http.ListenAndServe(":3000", nil)
 }
 
 // --- Universal TCP server on :3001 ---
@@ -215,70 +417,6 @@ func startUDPServer() {
 	}
 }
 
-// --- Handler for Avro ---
-func handleConnectionAvro(conn net.Conn) {
-	defer conn.Close()
-	buf := make([]byte, 0, 64*1024)
-	tmp := make([]byte, 64*1024)
-	for {
-		// Parse as many messages as possible from buffer
-		for {
-			if len(buf) < 4 {
-				break
-			}
-			msgLen := binary.BigEndian.Uint32(buf[:4])
-			if msgLen == 0 || msgLen > 10*1024 {
-				log.Printf("Invalid avro message length: %d", msgLen)
-				return
-			}
-			if len(buf) < int(4+msgLen) {
-				break
-			}
-			start := time.Now()
-			msgBuf := buf[4 : 4+msgLen]
-			var avroMap map[string]interface{}
-			if err := avro.Unmarshal(avroCodec, msgBuf, &avroMap); err != nil {
-				log.Printf("Invalid TCP avro log format: %v", err)
-				buf = buf[4+msgLen:]
-				continue
-			}
-			entry := LogEntry{
-				Timestamp: toString(avroMap["timestamp"]),
-				Level:     toString(avroMap["level"]),
-				Message:   toString(avroMap["message"]),
-				Service:   toString(avroMap["service"]),
-			}
-			if err := entry.Validate(); err != nil {
-				log.Printf("Invalid log entry: %v", err)
-				buf = buf[4+msgLen:]
-				continue
-			}
-			enqueueLog(entry)
-			recordLatency(time.Since(start))
-			buf = buf[4+msgLen:]
-		}
-		// Read more data if not enough for a full message
-		n, err := conn.Read(tmp)
-		if err != nil {
-			return
-		}
-		buf = append(buf, tmp[:n]...)
-	}
-}
-
-// Helper to safely convert interface{} to string
-func toString(v interface{}) string {
-	if v == nil {
-		return ""
-	}
-	switch s := v.(type) {
-	case string:
-		return s
-	default:
-		return fmt.Sprintf("%v", s)
-	}
-}
-
 // --- Universal Handler ---
 func handleUniversalConnection(conn net.Conn) {
 	defer conn.Close()
@@ -314,29 +452,44 @@ func handleUniversalConnection(conn net.Conn) {
 		switch format {
 		case 0x01: // JSON
 			err = json.Unmarshal(msgBuf, &entry)
-		case 0x02: // Protobuf
-			var pbEntry logpb.LogEntry
-			err = proto.Unmarshal(msgBuf, &pbEntry)
-			if err == nil {
-				entry = LogEntry{
-					Timestamp: pbEntry.Timestamp,
-					Level:     pbEntry.Level,
-					Message:   pbEntry.Message,
-					Service:   pbEntry.Service,
+			if err == nil && jsonSchema != nil {
+				result, err2 := jsonSchema.Validate(gojsonschema.NewBytesLoader(msgBuf))
+				if err2 != nil || !result.Valid() {
+					log.Printf("JSON schema validation failed: %v", result.Errors())
+					err = fmt.Errorf("schema validation failed")
 				}
+			}
+		case 0x02: // Protobuf
+			if protoMsgDesc != nil {
+				pbEntry := dynamicpb.NewMessage(protoMsgDesc)
+				err = proto.Unmarshal(msgBuf, pbEntry)
+				if err == nil {
+					entry = LogEntry{
+						Timestamp: pbEntry.Get(pbEntry.Descriptor().Fields().ByName("timestamp")).String(),
+						Level:     pbEntry.Get(pbEntry.Descriptor().Fields().ByName("level")).String(),
+						Message:   pbEntry.Get(pbEntry.Descriptor().Fields().ByName("message")).String(),
+						Service:   pbEntry.Get(pbEntry.Descriptor().Fields().ByName("service")).String(),
+					}
+				}
+			} else {
+				err = fmt.Errorf("proto descriptor not loaded")
 			}
 		case 0x03: // Avro
-			var avroMap map[string]interface{}
-			err = avro.Unmarshal(avroCodec, msgBuf, &avroMap)
-			if err == nil {
-				entry = LogEntry{
-					Timestamp: toString(avroMap["timestamp"]),
-					Level:     toString(avroMap["level"]),
-					Message:   toString(avroMap["message"]),
-					Service:   toString(avroMap["service"]),
+			if avroCodec != nil {
+				var avroMap map[string]interface{}
+				err = avro.Unmarshal(avroCodec, msgBuf, &avroMap)
+				if err == nil {
+					entry = LogEntry{
+						Timestamp: toString(avroMap["timestamp"]),
+						Level:     toString(avroMap["level"]),
+						Message:   toString(avroMap["message"]),
+						Service:   toString(avroMap["service"]),
+					}
 				}
+			} else {
+				err = fmt.Errorf("avro schema not loaded")
 			}
-		case 0x04: // Raw text (simple fallback)
+		case 0x04: // Raw text
 			entry = parseRawLog(string(msgBuf))
 		default:
 			log.Printf("Unknown log format: %d", format)
@@ -359,8 +512,21 @@ func handleUniversalConnection(conn net.Conn) {
 	}
 }
 
+func toString(v interface{}) string {
+	if v == nil {
+		return ""
+	}
+	switch val := v.(type) {
+	case string:
+		return val
+	case fmt.Stringer:
+		return val.String()
+	default:
+		return fmt.Sprintf("%v", val)
+	}
+}
+
 func parseRawLog(line string) LogEntry {
-	// Example: 2025-06-30T12:34:56Z [INFO] [auth] User login successful
 	var ts, level, service, msg string
 	parts := strings.SplitN(line, " ", 4)
 	if len(parts) == 4 {
@@ -369,7 +535,6 @@ func parseRawLog(line string) LogEntry {
 		service = strings.Trim(parts[2], "[]")
 		msg = parts[3]
 	} else {
-		// fallback to defaults if parsing fails
 		ts = time.Now().UTC().Format(time.RFC3339)
 		level = "INFO"
 		service = "raw"
@@ -383,180 +548,27 @@ func parseRawLog(line string) LogEntry {
 	}
 }
 
-// Hash function to distribute logs
-func hash(entry LogEntry) int {
-	return int(crc32.ChecksumIEEE([]byte(entry.Timestamp+entry.Service))) % numWriters
-}
-
-func enqueueLog(entry LogEntry) {
-	idx := hash(entry)
-	select {
-	case logChans[idx] <- entry:
-		// enqueued
-	default:
-		atomic.AddInt64(&droppedLogs, 1)
-		if atomic.AddInt64(&droppedLogs, 1)%1000 == 0 {
-			log.Printf("[OVERLOAD] Log dropped! Total dropped: %d", atomic.LoadInt64(&droppedLogs))
-		}
+// --- Main ---
+func main() {
+	setupFile()
+	fetchAndCacheSchemas()
+	for i := 0; i < numWriters; i++ {
+		logChans[i] = make(chan LogEntry, 200000)
+		go writerWorker(i)
 	}
-}
+	go metricsLogger()
+	go startTCPServerUniversal()
+	go startUDPServer()
+	go startHTTPServer()
 
-func writerWorker(idx int) {
-	rotateLogFile(idx)
-	buffer := make([]LogEntry, 0, 100000)
-	flushTimer := time.NewTicker(500 * time.Millisecond)
-	defer flushTimer.Stop()
-
-	for {
-		select {
-		case entry, ok := <-logChans[idx]:
-			if !ok {
-				flushLogs(idx, buffer)
-				return
-			}
-			buffer = append(buffer, entry)
-			atomic.AddInt64(&processCount, 1)
-			atomic.StoreInt64(&queueLength, int64(len(logChans[idx])))
-			if len(buffer) >= 20000 || shouldRotate(idx) {
-				flushLogs(idx, buffer)
-				buffer = buffer[:0]
-			}
-		case <-flushTimer.C:
-			if len(buffer) > 0 {
-				flushLogs(idx, buffer)
-				buffer = buffer[:0]
-			}
-		}
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	<-sigChan
+	log.Println("Shutting down, flushing logs...")
+	for i := 0; i < numWriters; i++ {
+		close(logChans[i])
 	}
-}
-
-func flushLogs(idx int, logs []LogEntry) {
-	writerLocks[idx].Lock()
-	defer writerLocks[idx].Unlock()
-	rotateIfNeeded(idx)
-	for _, entry := range logs {
-		line, _ := json.Marshal(entry)
-		zstdWriters[idx].Write([]byte(string(line) + "\n"))
-		atomic.AddInt64(&totalBytes, int64(len(line)+1))
+	for i := 0; i < numWriters; i++ {
+		closeLogFile(i)
 	}
-	zstdWriters[idx].Flush()
-}
-
-func shouldRotate(idx int) bool {
-	if logFiles[idx] == nil {
-		return true
-	}
-	info, err := logFiles[idx].Stat()
-	return err != nil || info.Size() >= rotationSize
-}
-
-func rotateIfNeeded(idx int) {
-	if shouldRotate(idx) {
-		rotateLogFile(idx)
-	}
-}
-
-func rotateLogFile(idx int) {
-	closeLogFile(idx)
-	timestamp := time.Now().Format("20060102_150405")
-	filePath := filepath.Join("./data", fmt.Sprintf("log_%d_%s.jsonl.zst", idx, timestamp))
-	f, err := os.Create(filePath)
-	if err != nil {
-		log.Fatalf("Failed to create log file: %v", err)
-	}
-	logFiles[idx] = f
-	encoder, err := zstd.NewWriter(f, zstd.WithEncoderLevel(zstd.SpeedFastest))
-	if err != nil {
-		log.Fatalf("Failed to create zstd writer: %v", err)
-	}
-	zstdWriters[idx] = encoder
-	fileRotationCount++
-	log.Printf("Started new log file: %s", filePath)
-}
-
-func closeLogFile(idx int) {
-	if zstdWriters[idx] != nil {
-		zstdWriters[idx].Close()
-	}
-	if logFiles[idx] != nil {
-		logFiles[idx].Close()
-	}
-}
-
-func metricsLogger() {
-	for range rateTicker.C {
-		metricsMutex.Lock()
-		rate := atomic.LoadInt64(&processCount)
-		bytesPerSec := atomic.LoadInt64(&totalBytes)
-		totalLat := atomic.LoadInt64(&totalLatency)
-		latCount := atomic.LoadInt64(&latencyCount)
-		queueLen := atomic.LoadInt64(&queueLength)
-		maxQueue := atomic.LoadInt64(&maxQueueLength)
-		rotations := atomic.LoadInt32((*int32)(&fileRotationCount))
-		dropped := atomic.LoadInt64(&droppedLogs)
-
-		avgLatency := float64(0)
-		if latCount > 0 {
-			avgLatency = float64(totalLat) / float64(latCount)
-		}
-		if queueLen > maxQueue {
-			atomic.StoreInt64(&maxQueueLength, queueLen)
-			maxQueue = queueLen
-		}
-		numGoroutines := runtime.NumGoroutine()
-
-		// Save snapshot for HTTP
-		lastMetrics = MetricsSnapshot{
-			LogsPerSec:    rate,
-			MBPerSec:      float64(bytesPerSec) / (1024 * 1024),
-			LatencyUs:     avgLatency,
-			QueueLength:   queueLen,
-			FileRotations: rotations,
-			Dropped:       dropped,
-		}
-
-		// Reset counters
-		atomic.StoreInt64(&processCount, 0)
-		atomic.StoreInt64(&totalBytes, 0)
-		atomic.StoreInt64(&totalLatency, 0)
-		atomic.StoreInt64(&latencyCount, 0)
-
-		var totalFileSize int64
-		for i := 0; i < numWriters; i++ {
-			if logFiles[i] != nil {
-				info, err := logFiles[i].Stat()
-				if err == nil {
-					totalFileSize += info.Size()
-				}
-			}
-		}
-
-		log.Printf("[METRIC] Logs/sec: %d, MB/s: %.2f, Latency: %.2fµs, Queue: %d (max: %d), Rotations: %d, Goroutines: %d, FileSize: %.2fMB, Dropped: %d",
-			rate, float64(bytesPerSec)/(1024*1024), avgLatency, queueLen, maxQueue, rotations, numGoroutines, float64(totalFileSize)/(1024*1024), dropped)
-		metricsMutex.Unlock()
-	}
-}
-
-func recordLatency(d time.Duration) {
-	atomic.AddInt64(&totalLatency, d.Microseconds())
-	atomic.AddInt64(&latencyCount, 1)
-}
-
-func startHTTPServer() {
-	http.Handle("/", http.FileServer(http.Dir("./static")))
-	http.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
-		metricsMutex.Lock()
-		snap := lastMetrics
-		metricsMutex.Unlock()
-		fmt.Fprintf(w, `{"logs_per_sec": %d, "mb_per_sec": %.2f, "latency_us": %.2f, "queue_length": %d, "file_rotations": %d, "dropped": %d}`,
-			snap.LogsPerSec,
-			snap.MBPerSec,
-			snap.LatencyUs,
-			snap.QueueLength,
-			snap.FileRotations,
-			snap.Dropped,
-		)
-	})
-	log.Println("Dashboard available at http://localhost:3000")
-	http.ListenAndServe(":3000", nil)
 }

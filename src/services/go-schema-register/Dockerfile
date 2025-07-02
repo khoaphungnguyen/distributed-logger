@@ -1,5 +1,5 @@
 # Use minimal Go image
-FROM golang:1.24-alpine
+FROM golang:1.24-alpine 
 
 # Set working directory 
 WORKDIR /app
@@ -8,7 +8,8 @@ WORKDIR /app
 COPY . .
 
 # Build the Go App
-RUN go build -o tcp-ingestor main.go
+RUN go build -o schema-register main.go
+
 
 # Run the TCP server
-CMD ["./tcp-ingestor"]
+CMD ["./schema-register"]

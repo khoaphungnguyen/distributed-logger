@@ -1,4 +1,4 @@
-module go-client
+module go-schema-register
 
 go 1.24.4
 

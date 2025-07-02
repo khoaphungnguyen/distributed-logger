@@ -6,9 +6,12 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"flag"
+	"fmt"
+	"io/ioutil"
 	"log"
 	"math/rand"
 	"net"
+	"net/http"
 	"os/signal"
 	"strings"
 	"syscall"
@@ -17,7 +20,13 @@ import (
 	logpb "go-client/proto"
 
 	"github.com/hamba/avro/v2"
+	"github.com/xeipuuv/gojsonschema"
+	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protodesc"
+	"google.golang.org/protobuf/reflect/protoreflect"
+	"google.golang.org/protobuf/types/descriptorpb"
+	"google.golang.org/protobuf/types/dynamicpb"
 )
 
 const (
@@ -34,19 +43,6 @@ type LogEntry struct {
 	Message   string `json:"message"`
 }
 
-var avroSchema = `{
-  "type": "record",
-  "name": "LogEntry",
-  "fields": [
-    {"name": "timestamp", "type": "string"},
-    {"name": "level", "type": "string"},
-    {"name": "message", "type": "string"},
-    {"name": "service", "type": "string"}
-  ]
-}`
-
-var avroCodec = avro.MustParse(avroSchema)
-
 var levels = []string{"DEBUG", "INFO", "WARN", "ERROR"}
 var services = []string{"auth", "payment", "api", "db", "notification"}
 var messages = []string{
@@ -60,6 +56,95 @@ var messages = []string{
 	"Session expired",
 	"Order created",
 	"Resource not found",
+}
+
+// --- Dynamic schema fetching ---
+type SchemaInfo struct {
+	Format string `json:"format"`
+	Name   string `json:"name"`
+	Schema string `json:"schema"`
+}
+
+func fetchSchema(schemaRegistryURL, format, name string) (string, error) {
+	resp, err := http.Get(schemaRegistryURL + "/schema/get?format=" + format + "&name=" + name)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := ioutil.ReadAll(resp.Body)
+		return "", fmt.Errorf("fetch failed: %s", string(body))
+	}
+	var result struct {
+		Schema string `json:"schema"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", err
+	}
+	return result.Schema, nil
+}
+
+func fetchProtoDescriptor(schemaRegistryURL, name string) ([]byte, error) {
+	resp, err := http.Get(fmt.Sprintf("%s/schema/descriptor?name=%s", schemaRegistryURL, name))
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	return ioutil.ReadAll(resp.Body)
+}
+
+func getProtoMsgDescriptor(descBytes []byte, name string) (protoreflect.MessageDescriptor, error) {
+	fds := &descriptorpb.FileDescriptorSet{}
+	if err := proto.Unmarshal(descBytes, fds); err != nil {
+		return nil, err
+	}
+	for _, fdProto := range fds.File {
+		fd, err := protodesc.NewFile(fdProto, nil)
+		if err != nil {
+			continue
+		}
+		if md := fd.Messages().ByName(protoreflect.Name(name)); md != nil {
+			return md, nil
+		}
+	}
+	return nil, fmt.Errorf("message descriptor not found")
+}
+
+// --- Validation helpers ---
+func validateJSONLog(schemaStr string, entry LogEntry) error {
+	loader := gojsonschema.NewStringLoader(schemaStr)
+	schema, err := gojsonschema.NewSchema(loader)
+	if err != nil {
+		return err
+	}
+	b, _ := json.Marshal(entry)
+	docLoader := gojsonschema.NewBytesLoader(b)
+	result, err := schema.Validate(docLoader)
+	if err != nil {
+		return err
+	}
+	if !result.Valid() {
+		return fmt.Errorf("validation failed: %v", result.Errors())
+	}
+	return nil
+}
+
+func validateAvroLog(schemaStr string, entry LogEntry) error {
+	codec, err := avro.Parse(schemaStr)
+	if err != nil {
+		return fmt.Errorf("invalid Avro schema: %v", err)
+	}
+	avroMap := map[string]interface{}{
+		"timestamp": entry.Timestamp,
+		"level":     entry.Level,
+		"message":   entry.Message,
+		"service":   entry.Service,
+	}
+	_, err = avro.Marshal(codec, avroMap)
+	if err != nil {
+		return fmt.Errorf("Avro validation failed: %v", err)
+	}
+	return nil
 }
 
 func randomLog() LogEntry {
@@ -84,10 +169,10 @@ func sendWithRetry(conn net.Conn, data []byte, maxRetries int) error {
 	return err
 }
 
+// --- Main ---
 func main() {
 	rand.Seed(time.Now().UnixNano())
 
-	// Configurable address and port
 	address := flag.String("address", "go-ingestor", "Ingestor host address")
 	tcpPort := flag.String("tcp-port", "", "TCP port (auto by format if empty)")
 	udpPort := flag.String("udp-port", "3002", "UDP port")
@@ -95,14 +180,13 @@ func main() {
 	intervalMs := flag.Int("interval", 100, "Interval in milliseconds between batches")
 	useUDP := flag.Bool("udp", false, "Use UDP instead of TCP")
 	format := flag.String("format", "json", "Log format: json, proto, avro, or raw")
+	typeName := flag.String("type", "LogEntry", "Schema type name")
 	flag.Parse()
 
-	// Always use universal handler on TCP port 3001
 	if !*useUDP {
 		*tcpPort = "3001"
 	}
 
-	// Graceful shutdown
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -132,6 +216,34 @@ func main() {
 
 	ticker := time.NewTicker(time.Duration(*intervalMs) * time.Millisecond)
 	defer ticker.Stop()
+	schemaRegistryURL := "http://go-schema-register:8000"
+
+	// --- Dynamic schema fetching ---
+	jsonSchemaStr, avroSchemaStr := "", ""
+	var msgDesc protoreflect.MessageDescriptor
+
+	if *format == "json" {
+		jsonSchemaStr, err = fetchSchema(schemaRegistryURL, "json", *typeName)
+		if err != nil {
+			log.Fatalf("Failed to fetch JSON schema: %v", err)
+		}
+	}
+	if *format == "avro" {
+		avroSchemaStr, err = fetchSchema(schemaRegistryURL, "avro", *typeName)
+		if err != nil {
+			log.Fatalf("Failed to fetch Avro schema: %v", err)
+		}
+	}
+	if *format == "proto" {
+		descBytes, err := fetchProtoDescriptor(schemaRegistryURL, *typeName)
+		if err != nil {
+			log.Fatalf("Failed to fetch proto descriptor: %v", err)
+		}
+		msgDesc, err = getProtoMsgDescriptor(descBytes, *typeName)
+		if err != nil {
+			log.Fatalf("Failed to get proto message descriptor: %v", err)
+		}
+	}
 
 	var sentBatches, failedBatches int
 
@@ -144,7 +256,6 @@ loop:
 		case <-ticker.C:
 			switch {
 			case !*useUDP:
-				// Always use universal handler for TCP
 				var batchBuf = make([]byte, 0, *batchSize*128)
 				var header byte
 				switch *format {
@@ -165,9 +276,19 @@ loop:
 					switch *format {
 					case "json":
 						entry := randomLog()
+						if err := validateJSONLog(jsonSchemaStr, entry); err != nil {
+							log.Printf("Log validation failed: %v", err)
+							continue
+						}
 						b, err = json.Marshal(entry)
 					case "proto":
 						entry := randomLog()
+						msg := dynamicpb.NewMessage(msgDesc)
+						bjson, _ := json.Marshal(entry)
+						if err := protojson.Unmarshal(bjson, msg); err != nil {
+							log.Printf("Proto log validation failed: %v", err)
+							continue
+						}
 						pbEntry := &logpb.LogEntry{
 							Timestamp: entry.Timestamp,
 							Level:     entry.Level,
@@ -177,13 +298,18 @@ loop:
 						b, err = proto.Marshal(pbEntry)
 					case "avro":
 						entry := randomLog()
+						if err := validateAvroLog(avroSchemaStr, entry); err != nil {
+							log.Printf("Avro log validation failed: %v", err)
+							continue
+						}
 						avroMap := map[string]interface{}{
 							"timestamp": entry.Timestamp,
 							"level":     entry.Level,
 							"message":   entry.Message,
 							"service":   entry.Service,
 						}
-						b, err = avro.Marshal(avroCodec, avroMap)
+						codec, _ := avro.Parse(avroSchemaStr)
+						b, err = avro.Marshal(codec, avroMap)
 					case "raw":
 						entry := randomLog()
 						rawLine := entry.Timestamp + " [" + entry.Level + "] [" + entry.Service + "] " + entry.Message
@@ -221,7 +347,6 @@ loop:
 					}
 					batch = append(batch, string(b))
 				}
-
 				const maxUDPPacket = 1400
 				chunks := splitBatchForUDP(batch, maxUDPPacket)
 				for i, chunk := range chunks {

@@ -38,6 +38,7 @@ We're building a distributed system for processing log data at scale. This repos
 - Supports configurable **batch size**, **send interval**, **address**, and **protocol** (TCP/UDP) via CLI flags
 - **Supports JSON, Protobuf, Avro, and Raw formats** for log transmission (`--format json`, `--format proto`, `--format avro`, or `--format raw`)
 - **Universal handler:** All formats are sent over a single secure TCP port (`3001`) with a format header for seamless ingestion
+- **Schema validation:** Client fetches schemas dynamically from the schema registry and validates logs before sending
 - **Graceful shutdown:** Handles SIGINT/SIGTERM for safe exit and resource cleanup
 - **UDP batch splitting:** Automatically splits large batches to avoid exceeding safe MTU (1400 bytes)
 - **UDP batch size warning:** Warns if any UDP chunk exceeds safe MTU
@@ -53,7 +54,7 @@ We're building a distributed system for processing log data at scale. This repos
 - **Universal handler:** Accepts JSON, Protobuf, Avro, and Raw logs on a single TCP port (`3001`) using a format header
 - **UDP ingestion** for high-throughput, lossy log reception (JSON only, port `3002`)
 - Handles each client in a separate goroutine
-- **Schema validation** for all formats
+- **Schema validation:** Server fetches schemas from the schema registry and validates all incoming logs for every format
 - Logs are written to file via buffered writer
 - Tracks and prints real-time **logs/sec**, **MB/sec**, **latency**, **queue length**, **file rotations**, and **dropped logs**
 - Supports **log rotation at 50MB** and **zstd compression** upon rotation
@@ -235,3 +236,12 @@ Compressed log files are written to:
 - 📝 **Raw log support:** Clients can send human-readable raw log lines; server parses and normalizes them.
 - 🛠️ **Unified ingestion pipeline:** No more separate ports for different formats—universal handler simplifies deployment and scaling.
 - 🌐 **Validated at scale:** Multiple clients sending mixed formats concurrently, all ingested and normalized with accurate metrics and robust performance.
+
+
+### 🚀 Day 13 Milestones
+
+- 🗄️ **Schema Registry Service:** Added a dedicated schema registry microservice.
+- 📥 **Dynamic schema registration:** Clients and servers can register, fetch, and list schemas for all supported formats (JSON, Avro, Protobuf) via HTTP API.
+- 🔄 **Dynamic schema fetching:** Both client and ingestor now fetch schemas from the registry at startup, enabling easy schema evolution and multi-type support.
+- 🛡️ **End-to-end schema validation:** Both client and server validate logs against the latest schema from the registry, ensuring data integrity and compatibility.
+- 🧩 **Extensible architecture:** System now supports registering and using multiple log types and schema versions, paving the way for future extensibility.
