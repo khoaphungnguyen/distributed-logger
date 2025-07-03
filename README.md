@@ -253,3 +253,11 @@ Compressed log files are written to:
 - 🛡️ **Schema validation for new formats:** Extended schema validation to cover logs ingested via syslog and journald, ensuring all data conforms to the unified schema and preventing ingestion of incomplete or malformed entries.
 - 📤 **Flexible output options:** Continued support for exporting logs in structured text and CSV formats, in addition to JSONL and compressed outputs.
 - 📊 **Dashboard enhancements:** Updated the web dashboard and `/metrics` endpoint to display live statistics and sample entries per log format, providing deeper operational insights and real-time visibility into ingested data.
+
+### 🚀 Day 15 Milestones
+
+- ✨ **Log enrichment pipeline:** Added an enrichment step to the ingestion pipeline, automatically attaching contextual metadata (such as `hostname`, `environment`, `app_version`, `received_at`, and container/pod info) to every log entry.
+- 🏷️ **Configurable enrichment fields:** Enrichment fields are sourced from environment variables and system calls, with sensible defaults for missing values.
+- 🔄 **Integrated enrichment in ingestor:** For small-scale deployments, enrichment is performed directly in the ingestor service for simplicity and performance.
+- 🧩 **Future-proof design:** The enrichment logic is modular and ready to be moved to a dedicated microservice as the system scales, enabling independent scaling and advanced enrichment strategies.
+- 📊 **Dashboard and metrics update:** The web dashboard and `/metrics` endpoint now display sample logs with all enrichment fields, providing full visibility into the enriched log schema.

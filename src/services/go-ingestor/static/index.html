@@ -125,12 +125,26 @@
           const sampleDiv = document.getElementById("sampleLogs");
           sampleDiv.innerHTML = "";
           if (data.samples) {
+            // Define a template with all enrichment fields
+            const enrichmentTemplate = {
+              timestamp: "",
+              level: "",
+              message: "",
+              service: "",
+              hostname: "",
+              environment: "",
+              app_version: "",
+              received_at: "",
+            };
             for (const fmt in data.samples) {
               if (data.samples[fmt].length > 0) {
                 sampleDiv.innerHTML += `<h3>${fmt}</h3><pre>${data.samples[fmt]
                   .map((s) => {
                     try {
-                      return JSON.stringify(JSON.parse(s), null, 2);
+                      // Merge sample with enrichment template for display
+                      const parsed = JSON.parse(s);
+                      const merged = { ...enrichmentTemplate, ...parsed };
+                      return JSON.stringify(merged, null, 2);
                     } catch {
                       return s;
                     }
