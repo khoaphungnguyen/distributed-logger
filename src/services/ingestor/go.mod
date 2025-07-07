@@ -1,4 +1,4 @@
-module go-ingestor
+module ingestor
 
 go 1.24.4
 

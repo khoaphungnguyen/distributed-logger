@@ -86,7 +86,7 @@ You can pass flags to the Go client container to configure its behavior:
 Example:
 
 ```yaml
-go-client:
+client:
   command: --batch 500 --interval 10 --address go-ingestor --format avro
 ```
 

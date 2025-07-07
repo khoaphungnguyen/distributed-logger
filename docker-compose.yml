@@ -1,32 +1,54 @@
 services:
-  go-schema-register:
+  schema-register:
     build:
-      context: ./src/services/go-schema-register
+      context: ./src/services/schema-register
     ports:
       - "8000:8000"
 
-  go-ingestor:
+
+  cluster-manager:
     build:
-      context: ./src/services/go-ingestor
-    command: ["./go-ingestor"]
+      context: ./src/services/cluster-manager
     ports:
-      - "3000:3000"
-    depends_on:
-      - go-schema-register
+      - "5000:5000"
 
-  go-client-1:
+  ingestor-1:
     build:
-      context: ./src/services/go-client
-    command: ["./go-client", "--batch", "4000", "--interval", "10"]
+      context: ./src/services/ingestor
+    environment:
+      - NODE_ADDR=http://ingestor-1:4001
+      - CLUSTER_MANAGER_ADDR=http://cluster-manager:5000
+      - INGESTOR_ADDR=:4001
+    ports:
+      - "4001:4001"
     depends_on:
-      - go-ingestor
+      - cluster-manager
 
-  go-client-2:
+  ingestor-2:
     build:
-      context: ./src/services/go-client
+      context: ./src/services/ingestor
+    environment:
+      - NODE_ADDR=http://ingestor-2:4002
+      - CLUSTER_MANAGER_ADDR=http://cluster-manager:5000
+      - INGESTOR_ADDR=:4002
+    ports:
+      - "4002:4002"
+    depends_on:
+      - cluster-manager
+
+  client-1:
+    build:
+      context: ./src/services/client
+    command: ["./client", "--batch", "4000", "--interval", "10"]
+    depends_on:
+      - ingestor
+
+  client-2:
+    build:
+      context: ./src/services/client
     command:
       [
-        "./go-client",
+        "./client",
         "--batch",
         "4000",
         "--interval",
@@ -35,20 +57,36 @@ services:
         "proto",
       ]
     depends_on:
-      - go-ingestor
+      - ingestor
 
-  go-client-3:
+  client-3:
     build:
-      context: ./src/services/go-client
+      context: ./src/services/client
     command:
-      ["./go-client", "--batch", "4000", "--interval", "10", "--format", "avro"]
+      [
+        "./client",
+        "--batch",
+        "4000",
+        "--interval",
+        "10",
+        "--format",
+        "avro",
+      ]
     depends_on:
-      - go-ingestor
+      - ingestor
 
-  go-client-4:
+  client-4:
     build:
-      context: ./src/services/go-client
+      context: ./src/services/client
     command:
-      ["./go-client", "--batch", "4000", "--interval", "10", "--format", "raw"]
+      [
+        "./client",
+        "--batch",
+        "4000",
+        "--interval",
+        "10",
+        "--format",
+        "raw",
+      ]
     depends_on:
-      - go-ingestor
+      - ingestor

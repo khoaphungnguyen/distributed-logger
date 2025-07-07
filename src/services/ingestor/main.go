@@ -35,6 +35,130 @@ import (
 	"google.golang.org/protobuf/types/dynamicpb"
 )
 
+// --- Cluster Manager Integration ---
+var (
+	clusterManagerAddr = os.Getenv("CLUSTER_MANAGER_ADDR") // e.g. "http://cluster-manager:5000"
+	selfAddr           = os.Getenv("NODE_ADDR")            // e.g. "http://ingestor-1:4001"
+	isLeader           bool
+	peers              = make(map[string]bool)
+	peersMutex         sync.Mutex
+)
+
+func registerWithClusterManager() {
+	body, _ := json.Marshal(map[string]string{"address": selfAddr})
+	_, err := http.Post(clusterManagerAddr+"/nodes/register", "application/json", bytes.NewReader(body))
+	if err != nil {
+		log.Fatalf("Failed to register with cluster manager: %v", err)
+	}
+	log.Printf("Registered with cluster manager as %s", selfAddr)
+}
+
+func unregisterWithClusterManager() {
+	body, _ := json.Marshal(map[string]string{"address": selfAddr})
+	http.Post(clusterManagerAddr+"/nodes/unregister", "application/json", bytes.NewReader(body))
+	log.Printf("Unregistered from cluster manager")
+}
+
+func updateLeaderAndPeers() {
+	resp, err := http.Get(clusterManagerAddr + "/leader")
+	if err != nil {
+		log.Printf("Failed to get leader: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+	var data struct {
+		Leader string `json:"leader"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		log.Printf("Failed to decode leader response: %v", err)
+		return
+	}
+	isLeader = (data.Leader == selfAddr)
+
+	// Update peers (healthy nodes except self)
+	resp2, err := http.Get(clusterManagerAddr + "/nodes")
+	if err != nil {
+		log.Printf("Failed to get nodes: %v", err)
+		return
+	}
+	defer resp2.Body.Close()
+	var nodes []struct {
+		Address   string `json:"address"`
+		IsHealthy bool   `json:"is_healthy"`
+	}
+	if err := json.NewDecoder(resp2.Body).Decode(&nodes); err != nil {
+		log.Printf("Failed to decode nodes: %v", err)
+		return
+	}
+	peersMutex.Lock()
+	peers = make(map[string]bool)
+	for _, n := range nodes {
+		if n.Address != selfAddr && n.IsHealthy {
+			peers[n.Address] = true
+		}
+	}
+	peersMutex.Unlock()
+}
+
+func periodicallyUpdateClusterState() {
+	for {
+		updateLeaderAndPeers()
+		if isLeader {
+			log.Printf("This node is the leader")
+		} else {
+			log.Printf("This node is a replica")
+		}
+		time.Sleep(5 * time.Second)
+	}
+}
+
+// --- Replication ---
+func replicateLogToPeers(entry LogEntry) {
+	peersMutex.Lock()
+	defer peersMutex.Unlock()
+	data, _ := json.Marshal(entry)
+	for addr := range peers {
+		go func(addr string) {
+			_, err := http.Post(addr+"/replicate", "application/json", bytes.NewReader(data))
+			if err != nil {
+				log.Printf("Replication to %s failed: %v", addr, err)
+			}
+		}(addr)
+	}
+}
+
+// --- Replication Handler ---
+func replicateHandler(w http.ResponseWriter, r *http.Request) {
+	if isLeader {
+		http.Error(w, "Leader does not accept replication", http.StatusForbidden)
+		return
+	}
+	var entry LogEntry
+	if err := json.NewDecoder(r.Body).Decode(&entry); err != nil {
+		http.Error(w, "Invalid log entry", 400)
+		return
+	}
+	enqueueLog(entry)
+	w.WriteHeader(http.StatusOK)
+}
+
+func checkIfLeader() bool {
+	resp, err := http.Get(clusterManagerAddr + "/leader")
+	if err != nil {
+		log.Printf("Failed to get leader: %v", err)
+		return false
+	}
+	defer resp.Body.Close()
+	var data struct {
+		Leader string `json:"leader"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		log.Printf("Failed to decode leader response: %v", err)
+		return false
+	}
+	return data.Leader == selfAddr
+}
+
 type LogEntry struct {
 	Timestamp   string `json:"timestamp"`
 	Level       string `json:"level"`
@@ -271,19 +395,6 @@ func flushLogs(idx int, logs []LogEntry) {
 // --- Log Processing ---
 func hash(entry LogEntry) int {
 	return int(crc32.ChecksumIEEE([]byte(entry.Timestamp+entry.Service))) % numWriters
-}
-
-func enqueueLog(entry LogEntry) {
-	idx := hash(entry)
-	select {
-	case logChans[idx] <- entry:
-		// enqueued
-	default:
-		atomic.AddInt64(&droppedLogs, 1)
-		if atomic.AddInt64(&droppedLogs, 1)%1000 == 0 {
-			log.Printf("[OVERLOAD] Log dropped! Total dropped: %d", atomic.LoadInt64(&droppedLogs))
-		}
-	}
 }
 
 func writerWorker(idx int) {
@@ -803,6 +914,21 @@ func main() {
 	flag.Parse()
 	outputFormat = outFmt
 
+	// Register with cluster manager
+	registerWithClusterManager()
+	defer unregisterWithClusterManager()
+
+	// Periodically update leader/peer state
+	go periodicallyUpdateClusterState()
+
+	// HTTP handler for replication
+	http.HandleFunc("/replicate", replicateHandler)
+
+	// Start your log ingestion servers (TCP/UDP/HTTP)
+	go startTCPServerUniversal()
+	go startUDPServer()
+	go startHTTPServer()
+
 	setupFile()
 	fetchAndCacheSchemas()
 	for i := 0; i < numWriters; i++ {
@@ -810,9 +936,7 @@ func main() {
 		go writerWorker(i)
 	}
 	go metricsLogger()
-	go startTCPServerUniversal()
-	go startUDPServer()
-	go startHTTPServer()
+	// Only leader should accept logs from clients
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
@@ -823,5 +947,24 @@ func main() {
 	}
 	for i := 0; i < numWriters; i++ {
 		closeLogFile(i)
+	}
+}
+
+func enqueueLog(entry LogEntry) {
+	if isLeader {
+		idx := hash(entry)
+		select {
+		case logChans[idx] <- entry:
+			// enqueued
+			replicateLogToPeers(entry)
+		default:
+			dropped := atomic.AddInt64(&droppedLogs, 1)
+			if dropped%1000 == 0 {
+				log.Printf("[OVERLOAD] Log dropped! Total dropped: %d", dropped)
+			}
+		}
+	} else {
+		// If not leader, drop or reject logs from clients
+		log.Printf("Not leader, dropping log: %+v", entry)
 	}
 }

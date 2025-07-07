@@ -1,4 +1,4 @@
-module go-schema-register
+module schema-register
 
 go 1.24.4
 

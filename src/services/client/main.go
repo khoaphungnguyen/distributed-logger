@@ -18,7 +18,7 @@ import (
 	"syscall"
 	"time"
 
-	logpb "go-client/proto"
+	logpb "client/proto"
 
 	"github.com/hamba/avro/v2"
 	"github.com/xeipuuv/gojsonschema"
