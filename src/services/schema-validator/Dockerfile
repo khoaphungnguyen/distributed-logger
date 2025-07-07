@@ -8,8 +8,8 @@ WORKDIR /app
 COPY . .
 
 # Build the Go App
-RUN go build -o schema-register main.go
+RUN go build -o schema-validator main.go
 
 
 # Run the TCP server
-CMD ["./schema-register"]
+CMD ["./schema-validator"]

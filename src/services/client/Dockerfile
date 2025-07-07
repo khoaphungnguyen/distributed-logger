@@ -3,4 +3,4 @@ FROM golang:1.24-alpine
 WORKDIR /app
 COPY . .
 
-RUN go build -o go-client main.go
+RUN go build -o client main.go

@@ -173,11 +173,56 @@ func sendWithRetry(conn net.Conn, data []byte, maxRetries int) error {
 	return err
 }
 
+// getLeaderHost queries the cluster manager for the current leader's hostname (no port).
+func getLeaderHost(clusterManagerURL string) (string, error) {
+	resp, err := http.Get(clusterManagerURL + "/leader-host")
+	if err != nil {
+		return "", fmt.Errorf("failed to query cluster manager: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := ioutil.ReadAll(resp.Body)
+		return "", fmt.Errorf("cluster manager error: %s", string(body))
+	}
+	var result struct {
+		Host string `json:"host"`
+		URL  string `json:"url"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", fmt.Errorf("failed to decode leader-host response: %w", err)
+	}
+	return result.Host, nil
+}
+
+// Helper to discover leader host
+func discoverLeader(clusterManagerURL string) (string, error) {
+	for retries := 0; retries < 5; retries++ {
+		leaderHost, err := getLeaderHost(clusterManagerURL)
+		if err == nil && leaderHost != "" {
+			return leaderHost, nil
+		}
+		log.Printf("Leader host discovery failed: %v (retrying...)", err)
+		time.Sleep(2 * time.Second)
+	}
+	return "", fmt.Errorf("could not discover leader after retries")
+}
+
 // --- Main ---
 func main() {
+	clusterManagerURL := "http://cluster-manager:5000"
+	var leaderHost string
+	var err error
+
+	// Discover leader host before connecting
+	leaderHost, err = discoverLeader(clusterManagerURL)
+	if leaderHost == "" {
+		log.Fatalf("Could not discover leader host: %v", err)
+	}
+
+	log.Println("Connecting to ingestor at", leaderHost)
+
 	rand.Seed(time.Now().UnixNano())
 
-	address := flag.String("address", "go-ingestor", "Ingestor host address")
 	tcpPort := flag.String("tcp-port", "", "TCP port (auto by format if empty)")
 	udpPort := flag.String("udp-port", "3002", "UDP port")
 	batchSize := flag.Int("batch", 100, "Number of logs per batch")
@@ -195,13 +240,13 @@ func main() {
 	defer stop()
 
 	var conn net.Conn
-	var err error
 	var addr string
+
 	if *useUDP {
-		addr = *address + ":" + *udpPort
+		addr = leaderHost + ":" + *udpPort
 		conn, err = net.Dial("udp", addr)
 	} else {
-		addr = *address + ":" + *tcpPort
+		addr = leaderHost + ":" + *tcpPort
 		tlsConfig := &tls.Config{
 			InsecureSkipVerify: true,
 		}
@@ -220,7 +265,7 @@ func main() {
 
 	ticker := time.NewTicker(time.Duration(*intervalMs) * time.Millisecond)
 	defer ticker.Stop()
-	schemaRegistryURL := "http://go-schema-register:8000"
+	schemaRegistryURL := "http://schema-validator:8000"
 
 	// --- Dynamic schema fetching ---
 	jsonSchemaStr, avroSchemaStr := "", ""
@@ -333,8 +378,36 @@ loop:
 				}
 				err = sendWithRetry(conn, batchBuf, 3)
 				if err != nil {
-					log.Printf("Failed to send universal batch after retries: %v", err)
-					failedBatches++
+					log.Printf("Send failed, refreshing leader: %v", err)
+					// Try to get new leader and reconnect
+					newLeader, err := discoverLeader(clusterManagerURL)
+					if err != nil || newLeader == "" {
+						log.Printf("Failed to refresh leader: %v", err)
+						failedBatches++
+						continue
+					}
+					if newLeader != leaderHost {
+						//log.Printf("Leader changed: %s -> %s, reconnecting...", leaderHost, newLeader)
+						leaderHost = newLeader
+						if conn != nil {
+							conn.Close()
+						}
+						conn, addr, err = connect(leaderHost, *tcpPort, *udpPort, *useUDP)
+						if err != nil {
+							log.Printf("Reconnect failed: %v", err)
+							failedBatches++
+							continue
+						}
+						//log.Printf("Reconnected to new leader at %s", leaderHost)
+					}
+					// Retry send once after reconnect
+					err = sendWithRetry(conn, batchBuf, 3)
+					if err != nil {
+						log.Printf("Retry failed: %v", err)
+						failedBatches++
+					} else {
+						sentBatches++
+					}
 				} else {
 					sentBatches++
 				}
@@ -369,6 +442,21 @@ loop:
 		}
 	}
 	log.Printf("Final stats: Sent batches: %d, Failed batches: %d", sentBatches, failedBatches)
+}
+
+func connect(leaderHost, tcpPort, udpPort string, useUDP bool) (net.Conn, string, error) {
+	var conn net.Conn
+	var addr string
+	var err error
+	if useUDP {
+		addr = leaderHost + ":" + udpPort
+		conn, err = net.Dial("udp", addr)
+	} else {
+		addr = leaderHost + ":" + tcpPort
+		tlsConfig := &tls.Config{InsecureSkipVerify: true}
+		conn, err = tls.Dial("tcp", addr, tlsConfig)
+	}
+	return conn, addr, err
 }
 
 // Returns a random log as a []byte and a string describing the type ("logentry", "syslog", "journald")

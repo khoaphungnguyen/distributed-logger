@@ -13,6 +13,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -38,10 +39,12 @@ import (
 // --- Cluster Manager Integration ---
 var (
 	clusterManagerAddr = os.Getenv("CLUSTER_MANAGER_ADDR") // e.g. "http://cluster-manager:5000"
-	selfAddr           = os.Getenv("NODE_ADDR")            // e.g. "http://ingestor-1:4001"
-	isLeader           bool
-	peers              = make(map[string]bool)
-	peersMutex         sync.Mutex
+	currentLeaderAddr  string
+
+	selfAddr   = os.Getenv("NODE_ADDR") // e.g. "http://ingestor-1:4001"
+	isLeader   bool
+	peers      = make(map[string]bool)
+	peersMutex sync.Mutex
 )
 
 func registerWithClusterManager() {
@@ -66,6 +69,11 @@ func updateLeaderAndPeers() {
 		return
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := ioutil.ReadAll(resp.Body)
+		log.Printf("Cluster manager /leader error: %s", string(body))
+		return
+	}
 	var data struct {
 		Leader string `json:"leader"`
 	}
@@ -73,6 +81,7 @@ func updateLeaderAndPeers() {
 		log.Printf("Failed to decode leader response: %v", err)
 		return
 	}
+	currentLeaderAddr = data.Leader
 	isLeader = (data.Leader == selfAddr)
 
 	// Update peers (healthy nodes except self)
@@ -103,27 +112,66 @@ func updateLeaderAndPeers() {
 func periodicallyUpdateClusterState() {
 	for {
 		updateLeaderAndPeers()
-		if isLeader {
-			log.Printf("This node is the leader")
-		} else {
-			log.Printf("This node is a replica")
-		}
-		time.Sleep(5 * time.Second)
+		time.Sleep(1 * time.Second)
 	}
 }
 
-// --- Replication ---
-func replicateLogToPeers(entry LogEntry) {
+// Replication batching
+var (
+	replicationQueue    = make(chan LogEntry, 100000)
+	replicationBatchSz  = 1000
+	replicationInterval = 50 * time.Millisecond
+)
+
+func replicationWorker() {
+	batch := make([]LogEntry, 0, replicationBatchSz)
+	ticker := time.NewTicker(replicationInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case entry := <-replicationQueue:
+			batch = append(batch, entry)
+			if len(batch) >= replicationBatchSz {
+				sendReplicationBatch(batch)
+				batch = batch[:0]
+			}
+		case <-ticker.C:
+			if len(batch) > 0 {
+				sendReplicationBatch(batch)
+				batch = batch[:0]
+			}
+		}
+	}
+}
+
+// In sendReplicationBatch, set ReplicatedAt for each entry:
+func sendReplicationBatch(batch []LogEntry) {
 	peersMutex.Lock()
 	defer peersMutex.Unlock()
-	data, _ := json.Marshal(entry)
+	now := time.Now().UTC().Format(time.RFC3339)
+	// Set ReplicatedAt for each entry in the batch
+	for i := range batch {
+		batch[i].ReplicatedAt = now
+	}
+	data, _ := json.Marshal(batch)
 	for addr := range peers {
 		go func(addr string) {
-			_, err := http.Post(addr+"/replicate", "application/json", bytes.NewReader(data))
+			resp, err := http.Post(addr+"/replicate", "application/json", bytes.NewReader(data))
 			if err != nil {
 				log.Printf("Replication to %s failed: %v", addr, err)
+				updateLeaderAndPeers()
+				return
 			}
+			resp.Body.Close()
 		}(addr)
+	}
+}
+
+func replicateLogToPeers(entry LogEntry) {
+	select {
+	case replicationQueue <- entry:
+	default:
+		log.Printf("Replication queue full, dropping log")
 	}
 }
 
@@ -133,41 +181,28 @@ func replicateHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Leader does not accept replication", http.StatusForbidden)
 		return
 	}
-	var entry LogEntry
-	if err := json.NewDecoder(r.Body).Decode(&entry); err != nil {
-		http.Error(w, "Invalid log entry", 400)
+	var entries []LogEntry
+	if err := json.NewDecoder(r.Body).Decode(&entries); err != nil {
+		http.Error(w, "Invalid log entry batch", 400)
 		return
 	}
-	enqueueLog(entry)
+	for _, entry := range entries {
+		enqueueReplicatedLog(entry)
+	}
 	w.WriteHeader(http.StatusOK)
 }
 
-func checkIfLeader() bool {
-	resp, err := http.Get(clusterManagerAddr + "/leader")
-	if err != nil {
-		log.Printf("Failed to get leader: %v", err)
-		return false
-	}
-	defer resp.Body.Close()
-	var data struct {
-		Leader string `json:"leader"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
-		log.Printf("Failed to decode leader response: %v", err)
-		return false
-	}
-	return data.Leader == selfAddr
-}
-
+// Add to LogEntry struct:
 type LogEntry struct {
-	Timestamp   string `json:"timestamp"`
-	Level       string `json:"level"`
-	Message     string `json:"message"`
-	Service     string `json:"service"`
-	Hostname    string `json:"hostname,omitempty"`
-	Environment string `json:"environment,omitempty"`
-	AppVersion  string `json:"app_version,omitempty"`
-	ReceivedAt  string `json:"received_at,omitempty"`
+	Timestamp    string `json:"timestamp"`
+	Level        string `json:"level"`
+	Message      string `json:"message"`
+	Service      string `json:"service"`
+	Hostname     string `json:"hostname,omitempty"`
+	Environment  string `json:"environment,omitempty"`
+	AppVersion   string `json:"app_version,omitempty"`
+	ReceivedAt   string `json:"received_at,omitempty"`
+	ReplicatedAt string `json:"replicated_at,omitempty"` // <-- Add this line
 }
 
 func (e *LogEntry) Validate() error {
@@ -257,7 +292,7 @@ var (
 
 func fetchAndCacheSchemas() {
 	// JSON Schema
-	resp, err := http.Get("http://go-schema-register:8000/schema/get?format=json&name=LogEntry")
+	resp, err := http.Get("http://schema-validator:8000/schema/get?format=json&name=LogEntry")
 	if err != nil {
 		log.Fatalf("Failed to fetch JSON schema: %v", err)
 	}
@@ -274,7 +309,7 @@ func fetchAndCacheSchemas() {
 	}
 
 	// Avro Schema
-	resp, err = http.Get("http://go-schema-register:8000/schema/get?format=avro&name=LogEntry")
+	resp, err = http.Get("http://schema-validator:8000/schema/get?format=avro&name=LogEntry")
 	if err != nil {
 		log.Fatalf("Failed to fetch Avro schema: %v", err)
 	}
@@ -288,7 +323,7 @@ func fetchAndCacheSchemas() {
 	}
 
 	// Protobuf Descriptor
-	resp, err = http.Get("http://go-schema-register:8000/schema/descriptor?name=LogEntry")
+	resp, err = http.Get("http://schema-validator:8000/schema/descriptor?name=LogEntry")
 	if err != nil {
 		log.Fatalf("Failed to fetch proto descriptor: %v", err)
 	}
@@ -311,7 +346,7 @@ func fetchAndCacheSchemas() {
 }
 
 // --- File and Writer Management ---
-const numWriters = 12
+const numWriters = 4
 
 var (
 	logChans     [numWriters]chan LogEntry
@@ -400,7 +435,7 @@ func hash(entry LogEntry) int {
 func writerWorker(idx int) {
 	rotateLogFile(idx)
 	buffer := make([]LogEntry, 0, 100000)
-	flushTimer := time.NewTicker(500 * time.Millisecond)
+	flushTimer := time.NewTicker(100 * time.Millisecond)
 	defer flushTimer.Stop()
 
 	for {
@@ -413,7 +448,7 @@ func writerWorker(idx int) {
 			buffer = append(buffer, entry)
 			atomic.AddInt64(&processCount, 1)
 			atomic.StoreInt64(&queueLength, int64(len(logChans[idx])))
-			if len(buffer) >= 20000 || shouldRotate(idx) {
+			if len(buffer) >= 1000 || shouldRotate(idx) {
 				flushLogs(idx, buffer)
 				buffer = buffer[:0]
 			}
@@ -479,8 +514,8 @@ func metricsLogger() {
 			}
 		}
 
-		log.Printf("[METRIC] Logs/sec: %d, MB/s: %.2f, Latency: %.2fµs, Queue: %d (max: %d), Rotations: %d, Goroutines: %d, FileSize: %.2fMB, Dropped: %d, Formats: %+v",
-			rate, float64(bytesPerSec)/(1024*1024), avgLatency, queueLen, maxQueue, rotations, numGoroutines, float64(totalFileSize)/(1024*1024), dropped, formatSnapshot)
+		log.Printf("[METRIC] Logs/sec: %d, MB/s: %.2f, Latency: %.2fµs, Queue: %d (max: %d), Rotations: %d, Goroutines: %d, FileSize: %.2fMB, Dropped: %d",
+			rate, float64(bytesPerSec)/(1024*1024), avgLatency, queueLen, maxQueue, rotations, numGoroutines, float64(totalFileSize)/(1024*1024), dropped)
 		metricsMutex.Unlock()
 	}
 }
@@ -906,6 +941,34 @@ func parseJournaldTimestamp(v interface{}) string {
 		return time.Now().UTC().Format(time.RFC3339)
 	}
 }
+func startClusterHTTPServer() {
+	http.HandleFunc("/cluster/health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ok"))
+	})
+	http.HandleFunc("/replicate", replicateHandler) // <-- Register here!
+
+	u, err := url.Parse(selfAddr)
+	if err != nil {
+		log.Fatalf("Invalid selfAddr: %v", err)
+	}
+	host := u.Host
+	_, port, err := net.SplitHostPort(host)
+	if err != nil {
+		log.Fatalf("Could not parse port from selfAddr (%s): %v", selfAddr, err)
+	}
+	addr := ":" + port
+
+	log.Printf("Cluster HTTP endpoints available at %s (listening on %s)", selfAddr, addr)
+	go func() {
+		err := http.ListenAndServe(addr, nil)
+		if err != nil {
+			log.Fatalf("Failed to start cluster HTTP server: %v", err)
+		}
+	}()
+}
+
+var shuttingDown int32
 
 // --- Main ---
 func main() {
@@ -914,15 +977,15 @@ func main() {
 	flag.Parse()
 	outputFormat = outFmt
 
+	startClusterHTTPServer()
+	go replicationWorker()
+
 	// Register with cluster manager
 	registerWithClusterManager()
 	defer unregisterWithClusterManager()
 
 	// Periodically update leader/peer state
 	go periodicallyUpdateClusterState()
-
-	// HTTP handler for replication
-	http.HandleFunc("/replicate", replicateHandler)
 
 	// Start your log ingestion servers (TCP/UDP/HTTP)
 	go startTCPServerUniversal()
@@ -941,6 +1004,7 @@ func main() {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 	<-sigChan
+	atomic.StoreInt32(&shuttingDown, 1)
 	log.Println("Shutting down, flushing logs...")
 	for i := 0; i < numWriters; i++ {
 		close(logChans[i])
@@ -950,7 +1014,11 @@ func main() {
 	}
 }
 
+// --- Enqueue Functions ---
 func enqueueLog(entry LogEntry) {
+	if atomic.LoadInt32(&shuttingDown) == 1 {
+		return
+	}
 	if isLeader {
 		idx := hash(entry)
 		select {
@@ -966,5 +1034,27 @@ func enqueueLog(entry LogEntry) {
 	} else {
 		// If not leader, drop or reject logs from clients
 		log.Printf("Not leader, dropping log: %+v", entry)
+	}
+}
+
+// In enqueueReplicatedLog, record latency if ReplicatedAt is set:
+func enqueueReplicatedLog(entry LogEntry) {
+	if atomic.LoadInt32(&shuttingDown) == 1 {
+		return
+	}
+	idx := hash(entry)
+	select {
+	case logChans[idx] <- entry:
+		// enqueued, counted in metrics
+		if entry.ReplicatedAt != "" {
+			if t, err := time.Parse(time.RFC3339, entry.ReplicatedAt); err == nil {
+				recordLatency(time.Since(t))
+			}
+		}
+	default:
+		dropped := atomic.AddInt64(&droppedLogs, 1)
+		if dropped%1000 == 0 {
+			log.Printf("[OVERLOAD] Log dropped! Total dropped: %d", dropped)
+		}
 	}
 }

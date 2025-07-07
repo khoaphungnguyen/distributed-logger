@@ -2,7 +2,10 @@
 
 ## Project Overview
 
-We're building a distributed system for processing log data at scale. This repository contains all the code and configuration needed to run the system.
+## Project Overview
+
+Distributed Logger is a scalable, high-performance log processing platform for cloud environments. It ingests logs in multiple formats (JSON, Protobuf, Avro, and raw) over secure TCP and UDP, with dynamic schema validation and enrichment. The clustered architecture provides automatic leader election, peer discovery, and efficient log replication for high availability. A dedicated cluster manager handles node registration, health checks, and leader tracking, while clients automatically follow the current leader for seamless failover. Live dashboards and metrics offer real-time operational insight, and the platform is fully containerized for an easy deployment.
+This repository contains all the code and configuration needed to run the system.
 
 ## Getting Started
 
@@ -261,3 +264,14 @@ Compressed log files are written to:
 - 🔄 **Integrated enrichment in ingestor:** For small-scale deployments, enrichment is performed directly in the ingestor service for simplicity and performance.
 - 🧩 **Future-proof design:** The enrichment logic is modular and ready to be moved to a dedicated microservice as the system scales, enabling independent scaling and advanced enrichment strategies.
 - 📊 **Dashboard and metrics update:** The web dashboard and `/metrics` endpoint now display sample logs with all enrichment fields, providing full visibility into the enriched log schema.
+
+
+### 🚀 Day 16 Milestones
+
+- 🗂️ **Cluster Manager Service:** Introduced a dedicated cluster manager microservice responsible for node registration, health checks, leader election, and peer discovery. All ingestors now register and synchronize their state via the cluster manager.
+- 👑 **Replicated Leader Architecture:** The ingestor service now supports leader election and log replication. Only the elected leader ingests logs from clients; followers receive replicated logs from the leader for high availability and durability.
+- 🔄 **Peer and Leader Synchronization:** Ingestors automatically update their view of the cluster, leader, and peers in real time, ensuring seamless failover and consistent replication.
+- 📦 **Efficient Batched Replication:** Log replication between leader and followers is performed in efficient batches, minimizing network overhead and maximizing throughput.
+- 🔁 **Client Leader Awareness:** The client now dynamically discovers and connects to the current leader via the cluster manager, automatically reconnecting if the leader changes or fails.
+- 🖥️ **Cluster Dashboard:** The cluster manager exposes a simple web dashboard displaying the current leader and all healthy peers, auto-refreshing every second for real-time cluster visibility and failover simulation.
+- 🛡️ **Robustness Improvements:** Enhanced shutdown handling, error recovery, and resource cleanup across all services to ensure stability during failover and rolling updates.
