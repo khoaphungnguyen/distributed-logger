@@ -123,9 +123,9 @@ Compressed log files are written to:
 
 ---
 
-## 🚀 Development Milestones
+## Development Milestones
 
-### Day 1 Milestones
+### 🚀 Day 1 Milestones
 
 - Set up development environment
 - Created project structure
@@ -134,7 +134,7 @@ Compressed log files are written to:
 - 🌐 Added web interface to view logs and config
 - 🚧 Documented configuration and endpoints
 
-### Day 2 Milestones
+### 🚀 Day 2 Milestones
 
 - ✅ Enhanced log generator with custom fields (e.g., user ID, session token)
 - 🔄 Supported multiple output formats: JSON, CSV, and plain text
@@ -142,7 +142,7 @@ Compressed log files are written to:
 - 🔁 Refined log patterns to reflect realistic event flows and timing
 - 📄 Updated documentation for log schema and usage examples
 
-### Day 3 Milestones
+### 🚀 Day 3 Milestones
 
 - 👁️ Built a real-time log collector using file watchers
 - 🧠 Supported multiple log formats (JSON and plain text) with dynamic parsing
@@ -152,7 +152,7 @@ Compressed log files are written to:
 - 💾 Persisted structured collected entries to `collected_logs/collected.jsonl`
 - 🚧 Updated Docker Compose to pass collector configuration via CLI arguments
 
-### Day 4 Milestones
+### 🚀 Day 4 Milestones
 
 - 🧹 Added support for SQLite and CSV as structured output formats alongside JSON
 - 📊 Implemented real-time statistics tracking for log levels, tags, and total entries
@@ -161,7 +161,7 @@ Compressed log files are written to:
 - 🧵 Used background threading to serve metrics without blocking the collector
 - 🚧️ Updated Docker Compose to support `--output-type`, `--filter`, and exposed web port
 
-### Day 5 Milestones
+### 🚀 Day 5 Milestones
 
 - 🔧 Introduced centralized log storage service (`log-storage`)
 - 🔁 Switched to Gunicorn for production-ready performance
@@ -169,7 +169,7 @@ Compressed log files are written to:
 - 📊 Improved web dashboard visuals and removed unnecessary charts
 - ⚡ Added real-time ingestion rate per second and source tracking
 
-### Day 6 Milestones
+### 🚀 Day 6 Milestones
 
 - 🚀 Transitioned to **Golang-based TCP log ingestion** (`go-ingestor`), replacing the original Flask-based ingestor, which could only handle around 150 messages per connection before significant slowdowns.
 - 🧱 Built high-performance `go-client` log generator with batching support
@@ -180,7 +180,7 @@ Compressed log files are written to:
 - 🧵 Used Goroutines for connection scaling, non-blocking write pipeline
 - 🐋 Updated Docker Compose to support multi-client scale testing
 
-### Day 7 Milestones
+### 🚀 Day 7 Milestones
 
 - 📡 **Added UDP ingestion support** alongside existing TCP server in `go-ingestor`
 - 🔀 **Dual protocol support** (TCP/UDP) running on ports `3000` and `3001`
@@ -195,7 +195,7 @@ Compressed log files are written to:
 - 💾 Observed Gzip compression saving **\~95%+ storage** on log files
 - 🔍 Simulated realistic log generation: 5% ERROR, 10% WARN, 85% INFO/DEBUG
 
-### Day 8 Milestones
+### 🚀 Day 8 Milestones
 
 - 🛡️ **Graceful shutdown**: Client now handles SIGINT/SIGTERM for safe exit and resource cleanup
 - ⚙️ **Configurable address and port**: Easily set ingestor host and port via CLI flags (`--address`, `--tcp-port`, `--udp-port`)
@@ -211,7 +211,7 @@ Compressed log files are written to:
 - 🛡️ **Production-ready ingestion**: Secure, reliable log delivery over TCP; UDP supported for high-throughput, lossy scenarios
 - 🧪 **Validated secure ingestion**: Confirmed end-to-end encrypted log flow and UDP chunking in multi-client tests
 
-### Day 10 Milestones
+### 🚀 Day 10 Milestones
 
 - 🚀 **Ultra-high throughput:** The Go ingestor now reliably handles **1 million log messages per second** on a single instance with minimal drops.
 - 🏎️ **Optimized concurrency:** Switched all metrics and counters to atomic operations, eliminating global mutex contention for maximum parallelism.
@@ -264,7 +264,6 @@ Compressed log files are written to:
 - 🔄 **Integrated enrichment in ingestor:** For small-scale deployments, enrichment is performed directly in the ingestor service for simplicity and performance.
 - 🧩 **Future-proof design:** The enrichment logic is modular and ready to be moved to a dedicated microservice as the system scales, enabling independent scaling and advanced enrichment strategies.
 - 📊 **Dashboard and metrics update:** The web dashboard and `/metrics` endpoint now display sample logs with all enrichment fields, providing full visibility into the enriched log schema.
-
 
 ### 🚀 Day 16 Milestones
 
