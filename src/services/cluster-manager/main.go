@@ -7,12 +7,14 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strings"
 	"sync"
 	"time"
 )
 
 type Node struct {
 	Address   string    `json:"address"`
+	Type      string    `json:"type"` // "ingestor" or "storage"
 	LastSeen  time.Time `json:"last_seen"`
 	IsHealthy bool      `json:"is_healthy"`
 }
@@ -23,10 +25,10 @@ var (
 	leader     string // Address of the current leader
 )
 
-// Register a node and elect leader if needed
+// Register a node (requires address and type)
 func registerHandler(w http.ResponseWriter, r *http.Request) {
 	var req Node
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Address == "" {
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Address == "" || req.Type == "" {
 		http.Error(w, "invalid request", 400)
 		return
 	}
@@ -34,10 +36,10 @@ func registerHandler(w http.ResponseWriter, r *http.Request) {
 	defer nodesMutex.Unlock()
 	nodes[req.Address] = &Node{
 		Address:   req.Address,
+		Type:      req.Type,
 		LastSeen:  time.Now(),
 		IsHealthy: true,
 	}
-	// Elect leader if none or leader is not healthy
 	if leader == "" || !nodes[leader].IsHealthy {
 		leader = electLeader()
 	}
@@ -67,6 +69,34 @@ func nodesHandler(w http.ResponseWriter, r *http.Request) {
 	list := []*Node{}
 	for _, n := range nodes {
 		list = append(list, n)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(list)
+}
+
+// Return only healthy storage nodes
+func storageNodesHandler(w http.ResponseWriter, r *http.Request) {
+	nodesMutex.Lock()
+	defer nodesMutex.Unlock()
+	list := []*Node{}
+	for _, n := range nodes {
+		if n.Type == "storage" && n.IsHealthy {
+			list = append(list, n)
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(list)
+}
+
+// Return only healthy ingestor nodes
+func ingestorNodesHandler(w http.ResponseWriter, r *http.Request) {
+	nodesMutex.Lock()
+	defer nodesMutex.Unlock()
+	list := []*Node{}
+	for _, n := range nodes {
+		if n.Type == "ingestor" && n.IsHealthy {
+			list = append(list, n)
+		}
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(list)
@@ -153,6 +183,7 @@ func healthCheckNodes() {
 	}
 }
 
+// Dashboard: group by type, show health, last seen, leader
 func dashboardHandler(w http.ResponseWriter, r *http.Request) {
 	nodesMutex.Lock()
 	defer nodesMutex.Unlock()
@@ -167,21 +198,32 @@ func dashboardHandler(w http.ResponseWriter, r *http.Request) {
 	} else {
 		fmt.Fprintf(w, "<p><b>Leader:</b> %s</p>", leader)
 	}
-	fmt.Fprint(w, "<h2>Peers</h2><table border=1><tr><th>Address</th><th>Healthy</th><th>Last Seen</th></tr>")
+	// Group nodes by type
+	types := map[string][]*Node{}
 	for _, n := range nodes {
-		status := "NO"
-		if n.IsHealthy {
-			status = "YES"
-		}
-		fmt.Fprintf(w, "<tr><td>%s</td><td>%s</td><td>%s</td></tr>", n.Address, status, n.LastSeen.Format(time.RFC3339))
+		types[n.Type] = append(types[n.Type], n)
 	}
-	fmt.Fprint(w, "</table></body></html>")
+	for nodeType, nodeList := range types {
+		fmt.Fprintf(w, "<h2>%s Nodes</h2><table border=1><tr><th>Address</th><th>Healthy</th><th>Last Seen</th></tr>", strings.Title(nodeType))
+		for _, n := range nodeList {
+			status := "NO"
+			if n.IsHealthy {
+				status = "YES"
+			}
+			fmt.Fprintf(w, "<tr><td>%s</td><td>%s</td><td>%s</td></tr>", n.Address, status, n.LastSeen.Format(time.RFC3339))
+		}
+		fmt.Fprint(w, "</table>")
+	}
+	fmt.Fprint(w, "</body></html>")
 }
+
 func main() {
 	http.HandleFunc("/", dashboardHandler)
 	http.HandleFunc("/nodes/register", registerHandler)
 	http.HandleFunc("/nodes/unregister", unregisterHandler)
 	http.HandleFunc("/nodes", nodesHandler)
+	http.HandleFunc("/storage-nodes", storageNodesHandler)
+	http.HandleFunc("/ingestor-nodes", ingestorNodesHandler)
 	http.HandleFunc("/leader", leaderHandler)
 	http.HandleFunc("/leader-host", leaderHostHandler)
 	go healthCheckNodes()

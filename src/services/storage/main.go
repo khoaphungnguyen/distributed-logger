@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"compress/gzip"
 	"encoding/json"
 	"fmt"
@@ -9,12 +10,13 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"time"
 )
 
-// LogEntry should match the struct used by ingestor
 type LogEntry struct {
 	Timestamp    string `json:"timestamp"`
 	Level        string `json:"level"`
@@ -24,12 +26,13 @@ type LogEntry struct {
 }
 
 var (
-	dataDir      = "./data"
-	mu           sync.Mutex
-	partitionMap = make(map[string]*os.File) // partitionKey -> file
+	dataDir            = "./data"
+	mu                 sync.Mutex
+	partitionMap       = make(map[string]*os.File) // partitionKey -> file
+	clusterManagerAddr = os.Getenv("CLUSTER_MANAGER_ADDR")
+	selfAddr           string
 )
 
-// Partition by service and hour
 func getPartitionKey(entry LogEntry) string {
 	t := time.Now()
 	if entry.Timestamp != "" {
@@ -41,7 +44,6 @@ func getPartitionKey(entry LogEntry) string {
 	return fmt.Sprintf("%s_%s", entry.Service, t.Format("2006-01-02-15"))
 }
 
-// Write log entry to a partition file
 func writeLog(entry LogEntry) error {
 	mu.Lock()
 	defer mu.Unlock()
@@ -64,7 +66,6 @@ func writeLog(entry LogEntry) error {
 	return err
 }
 
-// HTTP handler for log ingestion
 func logHandler(w http.ResponseWriter, r *http.Request) {
 	var entry LogEntry
 	if err := json.NewDecoder(r.Body).Decode(&entry); err != nil {
@@ -81,7 +82,6 @@ func logHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-// HTTP handler for querying logs (very basic, for demo)
 func queryHandler(w http.ResponseWriter, r *http.Request) {
 	service := r.URL.Query().Get("service")
 	partition := r.URL.Query().Get("partition")
@@ -91,7 +91,6 @@ func queryHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	filePath := filepath.Join(dataDir, fmt.Sprintf("partition_%s_%s.log", service, partition))
 	if _, err := os.Stat(filePath); os.IsNotExist(err) {
-		// Try gzipped version
 		filePath += ".gz"
 	}
 	f, err := os.Open(filePath)
@@ -103,7 +102,6 @@ func queryHandler(w http.ResponseWriter, r *http.Request) {
 	http.ServeContent(w, r, filePath, time.Now(), f)
 }
 
-// Compress files older than 3 days
 func compressOldFiles(olderThanDays int) {
 	for {
 		files, _ := filepath.Glob(filepath.Join(dataDir, "partition_*.log"))
@@ -141,18 +139,59 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("OK"))
 }
 
+func registerWithClusterManager(addr string) {
+	if clusterManagerAddr == "" {
+		log.Println("CLUSTER_MANAGER_ADDR not set, skipping registration")
+		return
+	}
+	body, _ := json.Marshal(map[string]string{
+		"address": addr,
+		"type":    "storage",
+	})
+	_, err := http.Post(clusterManagerAddr+"/nodes/register", "application/json", bytes.NewReader(body))
+	if err != nil {
+		log.Printf("Failed to register with cluster manager: %v", err)
+	} else {
+		log.Printf("Registered with cluster manager as %s", addr)
+	}
+}
+
+func unregisterWithClusterManager(addr string) {
+	if clusterManagerAddr == "" {
+		return
+	}
+	body, _ := json.Marshal(map[string]string{
+		"address": addr,
+	})
+	http.Post(clusterManagerAddr+"/nodes/unregister", "application/json", bytes.NewReader(body))
+	log.Printf("Unregistered from cluster manager")
+}
+
 func main() {
 	os.MkdirAll(dataDir, 0755)
-	go compressOldFiles(3) // Compress files older than 3 days
+	go compressOldFiles(3)
 	http.HandleFunc("/ingest", logHandler)
 	http.HandleFunc("/query", queryHandler)
-	http.HandleFunc("/health", healthHandler)
-
+	http.HandleFunc("/cluster/health", healthHandler)
 	ln, err := net.Listen("tcp", ":0")
 	if err != nil {
 		log.Fatalf("Failed to listen: %v", err)
 	}
-	addr := ln.Addr().String()
+	addr := "http://" + ln.Addr().String()
+	selfAddr = addr
+
+	registerWithClusterManager(selfAddr)
+	defer unregisterWithClusterManager(selfAddr)
+
+	// Graceful shutdown
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigChan
+		unregisterWithClusterManager(selfAddr)
+		os.Exit(0)
+	}()
+
 	log.Printf("Storage service listening on %s", addr)
 	log.Fatal(http.Serve(ln, nil))
 }
