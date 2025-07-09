@@ -167,17 +167,46 @@ func unregisterWithClusterManager(addr string) {
 	log.Printf("Unregistered from cluster manager")
 }
 
+func batchLogHandler(w http.ResponseWriter, r *http.Request) {
+	var entries []LogEntry
+	if err := json.NewDecoder(r.Body).Decode(&entries); err != nil {
+		http.Error(w, "Invalid batch payload", 400)
+		return
+	}
+	for _, entry := range entries {
+		if entry.PartitionKey == "" {
+			entry.PartitionKey = getPartitionKey(entry)
+		}
+		if err := writeLog(entry); err != nil {
+			http.Error(w, "Failed to write log", 500)
+			return
+		}
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
 func main() {
 	os.MkdirAll(dataDir, 0755)
 	go compressOldFiles(3)
 	http.HandleFunc("/ingest", logHandler)
+	http.HandleFunc("/ingest/batch", batchLogHandler)
 	http.HandleFunc("/query", queryHandler)
 	http.HandleFunc("/cluster/health", healthHandler)
-	ln, err := net.Listen("tcp", ":0")
+
+	storageName := os.Getenv("STORAGE_NAME")
+	if storageName == "" {
+		log.Fatal("STORAGE_NAME must be set")
+	}
+
+	ln, err := net.Listen("tcp", ":0") // random port
 	if err != nil {
 		log.Fatalf("Failed to listen: %v", err)
 	}
-	addr := "http://" + ln.Addr().String()
+	_, port, err := net.SplitHostPort(ln.Addr().String())
+	if err != nil {
+		log.Fatalf("Failed to parse port: %v", err)
+	}
+	addr := fmt.Sprintf("http://%s:%s", storageName, port)
 	selfAddr = addr
 
 	registerWithClusterManager(selfAddr)

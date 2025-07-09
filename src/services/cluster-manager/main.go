@@ -13,10 +13,13 @@ import (
 )
 
 type Node struct {
-	Address   string    `json:"address"`
-	Type      string    `json:"type"` // "ingestor" or "storage"
-	LastSeen  time.Time `json:"last_seen"`
-	IsHealthy bool      `json:"is_healthy"`
+	Address    string    `json:"address"`
+	Type       string    `json:"type"` // "ingestor" or "storage"
+	TCPPort    int       `json:"tcp_port,omitempty"`
+	UDPPort    int       `json:"udp_port,omitempty"`
+	HealthPort int       `json:"health_port,omitempty"`
+	LastSeen   time.Time `json:"last_seen"`
+	IsHealthy  bool      `json:"is_healthy"`
 }
 
 var (
@@ -35,12 +38,15 @@ func registerHandler(w http.ResponseWriter, r *http.Request) {
 	nodesMutex.Lock()
 	defer nodesMutex.Unlock()
 	nodes[req.Address] = &Node{
-		Address:   req.Address,
-		Type:      req.Type,
-		LastSeen:  time.Now(),
-		IsHealthy: true,
+		Address:    req.Address,
+		Type:       req.Type,
+		TCPPort:    req.TCPPort,
+		UDPPort:    req.UDPPort,
+		HealthPort: req.HealthPort,
+		LastSeen:   time.Now(),
+		IsHealthy:  true,
 	}
-	if leader == "" || !nodes[leader].IsHealthy {
+	if leader == "" || nodes[leader] == nil || !nodes[leader].IsHealthy {
 		leader = electLeader()
 	}
 	w.WriteHeader(http.StatusOK)
@@ -102,18 +108,25 @@ func ingestorNodesHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(list)
 }
 
-// Return the current leader
+// Return the current leader (with ports if available)
 func leaderHandler(w http.ResponseWriter, r *http.Request) {
 	nodesMutex.Lock()
 	defer nodesMutex.Unlock()
-	if leader == "" {
+	if leader == "" || nodes[leader] == nil {
 		http.Error(w, "no leader", 404)
 		return
 	}
+	n := nodes[leader]
 	resp := struct {
-		Leader string `json:"leader"`
+		Leader     string `json:"leader"`
+		TCPPort    int    `json:"tcp_port,omitempty"`
+		UDPPort    int    `json:"udp_port,omitempty"`
+		HealthPort int    `json:"health_port,omitempty"`
 	}{
-		Leader: leader,
+		Leader:     n.Address,
+		TCPPort:    n.TCPPort,
+		UDPPort:    n.UDPPort,
+		HealthPort: n.HealthPort,
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
@@ -145,11 +158,10 @@ func leaderHostHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(resp)
 }
 
-// Elect the leader: pick the healthy node with the earliest registration (lowest address as a simple rule)
 func electLeader() string {
 	var best string
 	for addr, n := range nodes {
-		if n.IsHealthy && (best == "" || addr < best) {
+		if n.Type == "ingestor" && n.IsHealthy && (best == "" || addr < best) {
 			best = addr
 		}
 	}
@@ -163,7 +175,14 @@ func healthCheckNodes() {
 		nodesMutex.Lock()
 		changed := false
 		for _, node := range nodes {
-			resp, err := http.Get(node.Address + "/cluster/health")
+			healthURL := node.Address
+			if node.HealthPort != 0 {
+				u, _ := url.Parse(node.Address)
+				healthURL = fmt.Sprintf("%s://%s:%d", u.Scheme, u.Hostname(), node.HealthPort)
+			}
+			healthURL += "/cluster/health"
+			resp, err := http.Get(healthURL)
+
 			wasHealthy := node.IsHealthy
 			if err != nil || resp.StatusCode != 200 {
 				node.IsHealthy = false
@@ -183,7 +202,7 @@ func healthCheckNodes() {
 	}
 }
 
-// Dashboard: group by type, show health, last seen, leader
+// Dashboard: group by type, show health, last seen, leader, and ports
 func dashboardHandler(w http.ResponseWriter, r *http.Request) {
 	nodesMutex.Lock()
 	defer nodesMutex.Unlock()
@@ -204,13 +223,13 @@ func dashboardHandler(w http.ResponseWriter, r *http.Request) {
 		types[n.Type] = append(types[n.Type], n)
 	}
 	for nodeType, nodeList := range types {
-		fmt.Fprintf(w, "<h2>%s Nodes</h2><table border=1><tr><th>Address</th><th>Healthy</th><th>Last Seen</th></tr>", strings.Title(nodeType))
+		fmt.Fprintf(w, "<h2>%s Nodes</h2><table border=1><tr><th>Address</th><th>TCP Port</th><th>UDP Port</th><th>Health Port</th><th>Healthy</th><th>Last Seen</th></tr>", strings.Title(nodeType))
 		for _, n := range nodeList {
 			status := "NO"
 			if n.IsHealthy {
 				status = "YES"
 			}
-			fmt.Fprintf(w, "<tr><td>%s</td><td>%s</td><td>%s</td></tr>", n.Address, status, n.LastSeen.Format(time.RFC3339))
+			fmt.Fprintf(w, "<tr><td>%s</td><td>%d</td><td>%d</td><td>%d</td><td>%s</td><td>%s</td></tr>", n.Address, n.TCPPort, n.UDPPort, n.HealthPort, status, n.LastSeen.Format(time.RFC3339))
 		}
 		fmt.Fprint(w, "</table>")
 	}

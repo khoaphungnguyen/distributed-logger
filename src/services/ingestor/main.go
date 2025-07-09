@@ -12,7 +12,6 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"os/signal"
 	"regexp"
@@ -33,34 +32,46 @@ import (
 	"google.golang.org/protobuf/types/dynamicpb"
 )
 
+const (
+	batchSize        = 10000                  // Number of logs per batch
+	batchFlushTime   = 200 * time.Millisecond // Max wait before sending batch
+	batchWorkerCount = 4                      // Number of parallel batch writers
+
+)
+
 // --- Cluster Manager Integration ---
 var (
 	clusterManagerAddr = os.Getenv("CLUSTER_MANAGER_ADDR") // e.g. "http://cluster-manager:5000"
 	currentLeaderAddr  string
 
-	selfAddr   = os.Getenv("NODE_ADDR") // e.g. "http://ingestor-1:4001"
-	isLeader   bool
-	peers      = make(map[string]bool)
-	peersMutex sync.Mutex
+	selfAddr string // set at runtime
+	isLeader bool
 
 	storageNodes      []string
 	storageNodesMutex sync.RWMutex
+
+	batchChan     = make(chan LogEntry, 100000) // Buffer for incoming logs
+	batchSendChan = make(chan []LogEntry, batchWorkerCount*2)
 )
 
-func registerWithClusterManager() {
-	body, _ := json.Marshal(map[string]string{
-		"address": selfAddr,
-		"type":    "ingestor",
+// Register with dynamic ports
+func registerWithClusterManager(addr string, tcpPort, udpPort, healthPort int) {
+	body, _ := json.Marshal(map[string]interface{}{
+		"address":     addr,
+		"type":        "ingestor",
+		"tcp_port":    tcpPort,
+		"udp_port":    udpPort,
+		"health_port": healthPort,
 	})
 	_, err := http.Post(clusterManagerAddr+"/nodes/register", "application/json", bytes.NewReader(body))
 	if err != nil {
 		log.Fatalf("Failed to register with cluster manager: %v", err)
 	}
-	log.Printf("Registered with cluster manager as %s (type=ingestor)", selfAddr)
+	log.Printf("Registered with cluster manager as %s (tcp:%d, udp:%d, health:%d)", addr, tcpPort, udpPort, healthPort)
 }
 
-func unregisterWithClusterManager() {
-	body, _ := json.Marshal(map[string]string{"address": selfAddr})
+func unregisterWithClusterManager(addr string) {
+	body, _ := json.Marshal(map[string]string{"address": addr})
 	http.Post(clusterManagerAddr+"/nodes/unregister", "application/json", bytes.NewReader(body))
 	log.Printf("Unregistered from cluster manager")
 }
@@ -303,6 +314,7 @@ func fetchAndCacheSchemas() {
 
 // --- Metrics ---
 func metricsLogger() {
+
 	for range rateTicker.C {
 		metricsMutex.Lock()
 		rate := atomic.LoadInt64(&processCount)
@@ -360,8 +372,9 @@ func recordSample(format string, entry LogEntry) {
 
 // --- HTTP Dashboard ---
 func startHTTPServer() {
-	http.Handle("/", http.FileServer(http.Dir("./static")))
-	http.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+	mux := http.NewServeMux()
+	mux.Handle("/", http.FileServer(http.Dir("./static")))
+	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
 		metricsMutex.Lock()
 		snap := lastMetrics
 		metricsMutex.Unlock()
@@ -396,44 +409,33 @@ func startHTTPServer() {
 		fmt.Fprint(w, "}}")
 	})
 	log.Println("Dashboard available at http://localhost:3000")
-	http.ListenAndServe(":3000", nil)
+	http.ListenAndServe(":3000", mux)
 }
 
-// --- Universal TCP server on :3001 ---
-func startTCPServerUniversal() {
+// --- Universal TCP server with dynamic port ---
+func startTCPServerUniversalOnListener(listener net.Listener) {
 	cert, err := tls.LoadX509KeyPair("./certs/cert.pem", "./certs/key.pem")
 	if err != nil {
 		log.Fatalf("Failed to load TLS certs: %v", err)
 	}
 	config := &tls.Config{Certificates: []tls.Certificate{cert}}
-
-	listener, err := tls.Listen("tcp", ":3001", config)
-	if err != nil {
-		log.Fatalf("Failed to listen on TCP port 3001: %v", err)
-	}
-	log.Println("TLS TCP (UNIVERSAL) log ingestor listening on :3001")
+	tlsListener := tls.NewListener(listener, config)
+	log.Printf("TLS TCP (UNIVERSAL) log ingestor listening on %s", listener.Addr().String())
 
 	for {
-		conn, err := listener.Accept()
+		conn, err := tlsListener.Accept()
 		if err != nil {
 			log.Printf("TCP Accept error: %v", err)
 			continue
 		}
+		// Limit concurrent connections to avoid goroutine explosion
 		go handleUniversalConnection(conn)
 	}
 }
 
-// --- JSON UDP server on :3002 ---
-func startUDPServer() {
-	addr, err := net.ResolveUDPAddr("udp", ":3002")
-	if err != nil {
-		log.Fatalf("Failed to resolve UDP port: %v", err)
-	}
-	conn, err := net.ListenUDP("udp", addr)
-	if err != nil {
-		log.Fatalf("Failed to listen on UDP port 3002: %v", err)
-	}
-	log.Println("UDP log ingestor listening on :3002")
+// --- JSON UDP server with dynamic port ---
+func startUDPServerOnConn(conn *net.UDPConn) {
+	log.Printf("UDP log ingestor listening on %s", conn.LocalAddr().String())
 
 	buf := make([]byte, 65535)
 	for {
@@ -463,7 +465,7 @@ func startUDPServer() {
 			entry.ReceivedAt = time.Now().UTC().Format(time.RFC3339)
 			recordSample("json", entry)
 
-			enqueueLog(entry)
+			enqueueLog(entry, len(line))
 			recordLatency(time.Since(start))
 			incrementFormatCount("json")
 		}
@@ -586,7 +588,7 @@ func handleUniversalConnection(conn net.Conn) {
 			entry.AppVersion = "unknown"
 		}
 		recordSample(formatType, entry)
-		enqueueLog(entry)
+		enqueueLog(entry, len(msgBuf))
 		recordLatency(time.Since(start))
 		incrementFormatCount(formatType)
 		buf = buf[5+msgLen:]
@@ -645,7 +647,6 @@ func detectLogFormat(line string) string {
 	if len(line) > 5 && line[0] == '<' {
 		for i := 1; i < len(line) && i < 5; i++ {
 			if line[i] == '>' && i > 1 {
-				// Looks like <number>
 				months := []string{"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"}
 				for _, m := range months {
 					if strings.HasPrefix(line[i+1:], m) {
@@ -659,7 +660,6 @@ func detectLogFormat(line string) string {
 }
 
 var syslogRegex = regexp.MustCompile(`^<(\d+)>([A-Z][a-z]{2}\s+\d+\s+\d{2}:\d{2}:\d{2})\s+(\S+)\s+(\S+)\[(\d+)\]:\s+(.*)$`)
-var journaldRegex = regexp.MustCompile(`"PRIORITY"\s*:\s*"(\d+)"`)
 
 func parseSyslog(line string) LogEntry {
 	m := syslogRegex.FindStringSubmatch(line)
@@ -762,17 +762,48 @@ func parseJournaldTimestamp(v interface{}) string {
 var shuttingDown int32
 
 func main() {
-	startClusterHTTPServer()
+	// Pick random TCP port for log ingestion
+	tcpListener, err := net.Listen("tcp", ":0")
+	if err != nil {
+		log.Fatalf("Failed to listen on TCP: %v", err)
+	}
+	tcpPort := tcpListener.Addr().(*net.TCPAddr).Port
 
-	registerWithClusterManager()
-	defer unregisterWithClusterManager()
+	// Pick random UDP port for log ingestion
+	udpAddr, err := net.ResolveUDPAddr("udp", ":0")
+	if err != nil {
+		log.Fatalf("Failed to resolve UDP: %v", err)
+	}
+	udpConn, err := net.ListenUDP("udp", udpAddr)
+	if err != nil {
+		log.Fatalf("Failed to listen on UDP: %v", err)
+	}
+	udpPort := udpConn.LocalAddr().(*net.UDPAddr).Port
+
+	// Pick random port for cluster HTTP health endpoint
+	healthListener, err := net.Listen("tcp", ":0")
+	if err != nil {
+		log.Fatalf("Failed to listen for health endpoint: %v", err)
+	}
+	healthPort := healthListener.Addr().(*net.TCPAddr).Port
+
+	hostname, _ := os.Hostname()
+	selfAddr = fmt.Sprintf("http://%s", hostname)
+
+	// Register all ports (including health_port)
+	registerWithClusterManager(selfAddr, tcpPort, udpPort, healthPort)
 
 	go periodicallyUpdateClusterState()
-	go startTCPServerUniversal()
-	go startUDPServer()
+	go startTCPServerUniversalOnListener(tcpListener)
+	go startUDPServerOnConn(udpConn)
 	go startHTTPServer()
+	go startClusterHTTPServerOnListener(healthListener)
 	fetchAndCacheSchemas()
 	go metricsLogger()
+	go batchDispatcher()
+	for i := 0; i < batchWorkerCount; i++ {
+		go batchWorker()
+	}
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
@@ -781,43 +812,96 @@ func main() {
 	log.Println("Shutting down...")
 }
 
+// Use this for the health endpoint
+func startClusterHTTPServerOnListener(listener net.Listener) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/cluster/health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ok"))
+	})
+	log.Printf("Cluster HTTP endpoints available at %s (listening on %s)", selfAddr, listener.Addr().String())
+	err := http.Serve(listener, mux)
+	if err != nil {
+		log.Fatalf("Failed to start cluster HTTP server: %v", err)
+	}
+}
+
 // --- Enqueue Functions ---
-func enqueueLog(entry LogEntry) {
+func enqueueLog(entry LogEntry, entrySize int) {
 	if atomic.LoadInt32(&shuttingDown) == 1 {
 		return
 	}
 	if isLeader {
-		if err := forwardToStorage(entry); err != nil {
-			log.Printf("Failed to forward log to storage: %v", err)
+		atomic.AddInt64(&processCount, 1)
+		atomic.AddInt64(&totalBytes, int64(entrySize))
+		select {
+		case batchChan <- entry:
+		default:
+			atomic.AddInt64(&droppedLogs, 1) // Drop if buffer full
 		}
 	} else {
-		log.Printf("Not leader, dropping log: %+v", entry)
+		atomic.AddInt64(&droppedLogs, 1)
 	}
 }
 
-// --- Cluster HTTP Server (for health check) ---
-func startClusterHTTPServer() {
-	http.HandleFunc("/cluster/health", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("ok"))
-	})
-
-	u, err := url.Parse(selfAddr)
-	if err != nil {
-		log.Fatalf("Invalid selfAddr: %v", err)
+// Forward a batch of logs to the storage nodes
+func forwardBatchToStorage(entries []LogEntry) error {
+	addr := ""
+	if len(entries) > 0 {
+		addr = pickStorageNode(entries[0])
 	}
-	host := u.Host
-	_, port, err := net.SplitHostPort(host)
-	if err != nil {
-		log.Fatalf("Could not parse port from selfAddr (%s): %v", selfAddr, err)
+	if addr == "" {
+		return fmt.Errorf("no available storage nodes")
 	}
-	addr := ":" + port
+	url := addr + "/ingest/batch"
+	b, _ := json.Marshal(entries)
+	resp, err := http.Post(url, "application/json", bytes.NewReader(b))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := ioutil.ReadAll(resp.Body)
+		return fmt.Errorf("storage error: %s", string(body))
+	}
+	return nil
+}
 
-	log.Printf("Cluster HTTP endpoints available at %s (listening on %s)", selfAddr, addr)
-	go func() {
-		err := http.ListenAndServe(addr, nil)
-		if err != nil {
-			log.Fatalf("Failed to start cluster HTTP server: %v", err)
+func batchDispatcher() {
+	batch := make([]LogEntry, 0, batchSize)
+	flush := func() {
+		if len(batch) == 0 {
+			return
 		}
-	}()
+		// Send a copy to avoid data race
+		batchCopy := make([]LogEntry, len(batch))
+		copy(batchCopy, batch)
+		batchSendChan <- batchCopy
+		batch = batch[:0]
+	}
+	timer := time.NewTimer(batchFlushTime)
+	for {
+		select {
+		case entry := <-batchChan:
+			batch = append(batch, entry)
+			if len(batch) >= batchSize {
+				flush()
+				if !timer.Stop() {
+					<-timer.C
+				}
+				timer.Reset(batchFlushTime)
+			}
+		case <-timer.C:
+			flush()
+			timer.Reset(batchFlushTime)
+		}
+	}
+}
+
+func batchWorker() {
+	for entries := range batchSendChan {
+		if err := forwardBatchToStorage(entries); err != nil {
+			log.Printf("Failed to forward batch to storage: %v", err)
+		}
+	}
 }

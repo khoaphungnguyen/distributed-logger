@@ -9,19 +9,12 @@ services:
     ports:
       - "5000:5000"
 
-  storage:
-    build:
-      context: ./src/services/storage
-    environment:
-      - CLUSTER_MANAGER_ADDR=http://cluster-manager:5000
-    depends_on:
-      - cluster-manager
-
   storage-1:
     build:
       context: ./src/services/storage
     environment:
-      - CLUSTER_MANAGER_ADDR"=http://cluster-manager:5000
+      - STORAGE_NAME=storage-1
+      - CLUSTER_MANAGER_ADDR=http://cluster-manager:5000
     depends_on:
       - cluster-manager
 
@@ -29,7 +22,17 @@ services:
     build:
       context: ./src/services/storage
     environment:
-      - CLUSTER_MANAGER_ADDR"=http://cluster-manager:5000
+      - STORAGE_NAME=storage-2
+      - CLUSTER_MANAGER_ADDR=http://cluster-manager:5000
+    depends_on:
+      - cluster-manager
+
+  storage-3:
+    build:
+      context: ./src/services/storage
+    environment:
+      - STORAGE_NAME=storage-3
+      - CLUSTER_MANAGER_ADDR=http://cluster-manager:5000
     depends_on:
       - cluster-manager
 
@@ -41,6 +44,9 @@ services:
       - CLUSTER_MANAGER_ADDR=http://cluster-manager:5000
     depends_on:
       - cluster-manager
+      - storage-1
+      - storage-2
+      - storage-3
 
   ingestor-2:
     build:
@@ -50,11 +56,14 @@ services:
       - CLUSTER_MANAGER_ADDR=http://cluster-manager:5000
     depends_on:
       - cluster-manager
+      - storage-1
+      - storage-2
+      - storage-3
 
   client-1:
     build:
       context: ./src/services/client
-    command: ["./client", "--batch", "1000", "--interval", "10"]
+    command: ["./client", "--batch", "2500", "--interval", "10"]
     depends_on:
       - ingestor-1
       - ingestor-2
@@ -63,7 +72,7 @@ services:
     build:
       context: ./src/services/client
     command:
-      ["./client", "--batch", "1000", "--interval", "10", "--format", "raw"]
+      ["./client", "--batch", "2500", "--interval", "10", "--format", "raw"]
     depends_on:
       - ingestor-1
       - ingestor-2
