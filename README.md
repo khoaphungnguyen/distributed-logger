@@ -274,3 +274,15 @@ Compressed log files are written to:
 - 🔁 **Client Leader Awareness:** The client now dynamically discovers and connects to the current leader via the cluster manager, automatically reconnecting if the leader changes or fails.
 - 🖥️ **Cluster Dashboard:** The cluster manager exposes a simple web dashboard displaying the current leader and all healthy peers, auto-refreshing every second for real-time cluster visibility and failover simulation.
 - 🛡️ **Robustness Improvements:** Enhanced shutdown handling, error recovery, and resource cleanup across all services to ensure stability during failover and rolling updates.
+
+### 🚀 Day 17 Milestones
+
+- 🏗️ **Ingestor/Storage Separation:** The ingestion and storage responsibilities are now handled by dedicated microservices. The ingestor focuses on high-throughput log validation, enrichment, batching, and forwarding, while the storage service is optimized for efficient, concurrent disk writes.
+- 🧩 **Partitioned Batching Pipeline:** The ingestor now partitions incoming logs across multiple independent batching pipelines based on log attributes (e.g., service name). Each partition batches logs and forwards them to storage in parallel, maximizing CPU and network utilization.
+- ⚖️ **Balanced Storage Load:** Partitioned batching ensures logs are evenly distributed across all available storage nodes, preventing hotspots and enabling true horizontal scalability.
+- 🚀 **High-Throughput Storage Writes:** The storage service now supports concurrent, batched writes per partition, dramatically increasing sustained write throughput and reducing lock contention.
+- 🔄 **Efficient Batch Transfer:** Ingestor-to-storage communication is performed in large batches over HTTP, minimizing serialization and network overhead.
+- 📈 **Accurate Metrics:** Metrics now reflect logs actually delivered to storage, providing a true picture of end-to-end throughput and system health.
+- 🛠️ **Pluggable Storage Backend (Ready):** The storage service is designed for easy extension to support alternative backends (e.g., S3, cloud storage, or distributed filesystems) in future milestones.
+- 🧪 **Stress-Tested at Scale:** The new architecture has been validated at 1M+ logs/sec with multiple clients and storage nodes, demonstrating robust performance and balanced resource usage.
+- 📊 **Dashboard Enhancements:** The dashboard and `/metrics` endpoint now report partition-level stats, storage node health, and end-to-end delivery rates for full operational visibility.

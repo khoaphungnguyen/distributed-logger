@@ -33,11 +33,23 @@ import (
 )
 
 const (
-	batchSize        = 10000                  // Number of logs per batch
-	batchFlushTime   = 200 * time.Millisecond // Max wait before sending batch
-	batchWorkerCount = 4                      // Number of parallel batch writers
-
+	partitionCount = 4 // or 12, tune for your CPU
+	batchSize      = 50000
+	batchFlushTime = 500 * time.Millisecond
 )
+
+var (
+	partitionChans      [partitionCount]chan LogEntry
+	partitionBatchChans [partitionCount]chan []LogEntry
+)
+
+var httpClient = &http.Client{
+	Transport: &http.Transport{
+		MaxIdleConns:        1000,
+		MaxIdleConnsPerHost: 1000,
+		IdleConnTimeout:     90 * time.Second,
+	},
+}
 
 // --- Cluster Manager Integration ---
 var (
@@ -49,9 +61,6 @@ var (
 
 	storageNodes      []string
 	storageNodesMutex sync.RWMutex
-
-	batchChan     = make(chan LogEntry, 100000) // Buffer for incoming logs
-	batchSendChan = make(chan []LogEntry, batchWorkerCount*2)
 )
 
 // Register with dynamic ports
@@ -188,25 +197,6 @@ func pickStorageNode(entry LogEntry) string {
 	h := sha1.Sum([]byte(key))
 	idx := int(h[0]) % len(storageNodes)
 	return storageNodes[idx]
-}
-
-func forwardToStorage(entry LogEntry) error {
-	addr := pickStorageNode(entry)
-	if addr == "" {
-		return fmt.Errorf("no available storage nodes")
-	}
-	url := addr + "/ingest"
-	b, _ := json.Marshal(entry)
-	resp, err := http.Post(url, "application/json", bytes.NewReader(b))
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		body, _ := ioutil.ReadAll(resp.Body)
-		return fmt.Errorf("storage error: %s", string(body))
-	}
-	return nil
 }
 
 // --- Metrics ---
@@ -408,8 +398,15 @@ func startHTTPServer() {
 		}
 		fmt.Fprint(w, "}}")
 	})
+	server := &http.Server{
+		Addr:         ":3000",
+		Handler:      mux,
+		IdleTimeout:  10 * time.Second, // Close idle connections after 10s
+		ReadTimeout:  5 * time.Second,
+		WriteTimeout: 10 * time.Second,
+	}
 	log.Println("Dashboard available at http://localhost:3000")
-	http.ListenAndServe(":3000", mux)
+	server.ListenAndServe()
 }
 
 // --- Universal TCP server with dynamic port ---
@@ -465,7 +462,7 @@ func startUDPServerOnConn(conn *net.UDPConn) {
 			entry.ReceivedAt = time.Now().UTC().Format(time.RFC3339)
 			recordSample("json", entry)
 
-			enqueueLog(entry, len(line))
+			enqueueLog(entry)
 			recordLatency(time.Since(start))
 			incrementFormatCount("json")
 		}
@@ -481,10 +478,12 @@ func handleUniversalConnection(conn net.Conn) {
 	buf := make([]byte, 0, 64*1024)
 	tmp := make([]byte, 64*1024)
 	for {
+
 		// Read header + length
 		for len(buf) < 5 {
 			n, err := conn.Read(tmp)
 			if err != nil {
+				// If timeout, connection will close and goroutine will exit
 				return
 			}
 			buf = append(buf, tmp[:n]...)
@@ -588,7 +587,7 @@ func handleUniversalConnection(conn net.Conn) {
 			entry.AppVersion = "unknown"
 		}
 		recordSample(formatType, entry)
-		enqueueLog(entry, len(msgBuf))
+		enqueueLog(entry)
 		recordLatency(time.Since(start))
 		incrementFormatCount(formatType)
 		buf = buf[5+msgLen:]
@@ -800,11 +799,13 @@ func main() {
 	go startClusterHTTPServerOnListener(healthListener)
 	fetchAndCacheSchemas()
 	go metricsLogger()
-	go batchDispatcher()
-	for i := 0; i < batchWorkerCount; i++ {
-		go batchWorker()
-	}
+	for i := 0; i < partitionCount; i++ {
+		partitionChans[i] = make(chan LogEntry, 200000)
+		partitionBatchChans[i] = make(chan []LogEntry)
+		go partitionBatchDispatcher(i)
+		go partitionBatchWorker(i)
 
+	}
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 	<-sigChan
@@ -812,7 +813,6 @@ func main() {
 	log.Println("Shutting down...")
 }
 
-// Use this for the health endpoint
 func startClusterHTTPServerOnListener(listener net.Listener) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/cluster/health", func(w http.ResponseWriter, r *http.Request) {
@@ -820,69 +820,50 @@ func startClusterHTTPServerOnListener(listener net.Listener) {
 		w.Write([]byte("ok"))
 	})
 	log.Printf("Cluster HTTP endpoints available at %s (listening on %s)", selfAddr, listener.Addr().String())
-	err := http.Serve(listener, mux)
+	server := &http.Server{
+		Handler:      mux,
+		IdleTimeout:  5 * time.Second, // Close idle connections after 5s
+		ReadTimeout:  2 * time.Second, // Optional: limit read time
+		WriteTimeout: 2 * time.Second, // Optional: limit write time
+	}
+	err := server.Serve(listener)
 	if err != nil {
 		log.Fatalf("Failed to start cluster HTTP server: %v", err)
 	}
 }
 
 // --- Enqueue Functions ---
-func enqueueLog(entry LogEntry, entrySize int) {
+func partitionIndex(entry LogEntry) int {
+	// Example: hash by service name
+	h := sha1.Sum([]byte(entry.Service))
+	return int(h[0]) % partitionCount
+}
+
+func enqueueLog(entry LogEntry) {
 	if atomic.LoadInt32(&shuttingDown) == 1 {
 		return
 	}
-	if isLeader {
-		atomic.AddInt64(&processCount, 1)
-		atomic.AddInt64(&totalBytes, int64(entrySize))
-		select {
-		case batchChan <- entry:
-		default:
-			atomic.AddInt64(&droppedLogs, 1) // Drop if buffer full
-		}
-	} else {
+	idx := partitionIndex(entry)
+	select {
+	case partitionChans[idx] <- entry:
+	default:
 		atomic.AddInt64(&droppedLogs, 1)
 	}
 }
 
-// Forward a batch of logs to the storage nodes
-func forwardBatchToStorage(entries []LogEntry) error {
-	addr := ""
-	if len(entries) > 0 {
-		addr = pickStorageNode(entries[0])
-	}
-	if addr == "" {
-		return fmt.Errorf("no available storage nodes")
-	}
-	url := addr + "/ingest/batch"
-	b, _ := json.Marshal(entries)
-	resp, err := http.Post(url, "application/json", bytes.NewReader(b))
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		body, _ := ioutil.ReadAll(resp.Body)
-		return fmt.Errorf("storage error: %s", string(body))
-	}
-	return nil
-}
-
-func batchDispatcher() {
+func partitionBatchDispatcher(idx int) {
 	batch := make([]LogEntry, 0, batchSize)
+	timer := time.NewTimer(batchFlushTime)
 	flush := func() {
 		if len(batch) == 0 {
 			return
 		}
-		// Send a copy to avoid data race
-		batchCopy := make([]LogEntry, len(batch))
-		copy(batchCopy, batch)
-		batchSendChan <- batchCopy
-		batch = batch[:0]
+		partitionBatchChans[idx] <- batch
+		batch = make([]LogEntry, 0, batchSize) // allocate a new slice for the next batch
 	}
-	timer := time.NewTimer(batchFlushTime)
 	for {
 		select {
-		case entry := <-batchChan:
+		case entry := <-partitionChans[idx]:
 			batch = append(batch, entry)
 			if len(batch) >= batchSize {
 				flush()
@@ -898,10 +879,35 @@ func batchDispatcher() {
 	}
 }
 
-func batchWorker() {
-	for entries := range batchSendChan {
+func partitionBatchWorker(idx int) {
+	for entries := range partitionBatchChans[idx] {
 		if err := forwardBatchToStorage(entries); err != nil {
-			log.Printf("Failed to forward batch to storage: %v", err)
+			log.Printf("Partition %d: Failed to forward batch: %v", idx, err)
 		}
 	}
+}
+
+// Forward a batch of logs to the storage nodes
+func forwardBatchToStorage(entries []LogEntry) error {
+	addr := ""
+	if len(entries) > 0 {
+		addr = pickStorageNode(entries[0])
+	}
+	if addr == "" {
+		return fmt.Errorf("no available storage nodes")
+	}
+	url := addr + "/ingest/batch"
+	b, _ := json.Marshal(entries)
+	resp, err := httpClient.Post(url, "application/json", bytes.NewReader(b))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := ioutil.ReadAll(resp.Body)
+		return fmt.Errorf("storage error: %s", string(body))
+	}
+	atomic.AddInt64(&processCount, int64(len(entries)))
+	atomic.AddInt64(&totalBytes, int64(len(b)))
+	return nil
 }

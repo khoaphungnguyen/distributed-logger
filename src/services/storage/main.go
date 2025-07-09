@@ -27,8 +27,9 @@ type LogEntry struct {
 
 var (
 	dataDir            = "./data"
-	mu                 sync.Mutex
 	partitionMap       = make(map[string]*os.File) // partitionKey -> file
+	partitionLocks     = make(map[string]*sync.Mutex)
+	locksMu            sync.Mutex
 	clusterManagerAddr = os.Getenv("CLUSTER_MANAGER_ADDR")
 	selfAddr           string
 )
@@ -44,13 +45,25 @@ func getPartitionKey(entry LogEntry) string {
 	return fmt.Sprintf("%s_%s", entry.Service, t.Format("2006-01-02-15"))
 }
 
+func getPartitionLock(partition string) *sync.Mutex {
+	locksMu.Lock()
+	defer locksMu.Unlock()
+	l, ok := partitionLocks[partition]
+	if !ok {
+		l = &sync.Mutex{}
+		partitionLocks[partition] = l
+	}
+	return l
+}
+
 func writeLog(entry LogEntry) error {
-	mu.Lock()
-	defer mu.Unlock()
 	partition := entry.PartitionKey
 	if partition == "" {
 		partition = getPartitionKey(entry)
 	}
+	lock := getPartitionLock(partition)
+	lock.Lock()
+	defer lock.Unlock()
 	f, ok := partitionMap[partition]
 	if !ok {
 		filePath := filepath.Join(dataDir, fmt.Sprintf("partition_%s.log", partition))
@@ -66,6 +79,46 @@ func writeLog(entry LogEntry) error {
 	return err
 }
 
+func writeLogBatch(entries []LogEntry) error {
+	// Group entries by partition
+	partitioned := make(map[string][]LogEntry)
+	for _, entry := range entries {
+		partition := entry.PartitionKey
+		if partition == "" {
+			partition = getPartitionKey(entry)
+		}
+		partitioned[partition] = append(partitioned[partition], entry)
+	}
+	// Write each partition in batch
+	for partition, group := range partitioned {
+		lock := getPartitionLock(partition)
+		lock.Lock()
+		f, ok := partitionMap[partition]
+		if !ok {
+			filePath := filepath.Join(dataDir, fmt.Sprintf("partition_%s.log", partition))
+			var err error
+			f, err = os.OpenFile(filePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+			if err != nil {
+				lock.Unlock()
+				return err
+			}
+			partitionMap[partition] = f
+		}
+		var buf bytes.Buffer
+		for _, entry := range group {
+			b, _ := json.Marshal(entry)
+			buf.Write(b)
+			buf.WriteByte('\n')
+		}
+		if _, err := f.Write(buf.Bytes()); err != nil {
+			lock.Unlock()
+			return err
+		}
+		lock.Unlock()
+	}
+	return nil
+}
+
 func logHandler(w http.ResponseWriter, r *http.Request) {
 	var entry LogEntry
 	if err := json.NewDecoder(r.Body).Decode(&entry); err != nil {
@@ -77,6 +130,19 @@ func logHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := writeLog(entry); err != nil {
 		http.Error(w, "Failed to write log", 500)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+func batchLogHandler(w http.ResponseWriter, r *http.Request) {
+	var entries []LogEntry
+	if err := json.NewDecoder(r.Body).Decode(&entries); err != nil {
+		http.Error(w, "Invalid batch payload", 400)
+		return
+	}
+	if err := writeLogBatch(entries); err != nil {
+		http.Error(w, "Failed to write batch", 500)
 		return
 	}
 	w.WriteHeader(http.StatusOK)
@@ -165,24 +231,6 @@ func unregisterWithClusterManager(addr string) {
 	})
 	http.Post(clusterManagerAddr+"/nodes/unregister", "application/json", bytes.NewReader(body))
 	log.Printf("Unregistered from cluster manager")
-}
-
-func batchLogHandler(w http.ResponseWriter, r *http.Request) {
-	var entries []LogEntry
-	if err := json.NewDecoder(r.Body).Decode(&entries); err != nil {
-		http.Error(w, "Invalid batch payload", 400)
-		return
-	}
-	for _, entry := range entries {
-		if entry.PartitionKey == "" {
-			entry.PartitionKey = getPartitionKey(entry)
-		}
-		if err := writeLog(entry); err != nil {
-			http.Error(w, "Failed to write log", 500)
-			return
-		}
-	}
-	w.WriteHeader(http.StatusOK)
 }
 
 func main() {

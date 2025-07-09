@@ -187,12 +187,14 @@ func healthCheckNodes() {
 			if err != nil || resp.StatusCode != 200 {
 				node.IsHealthy = false
 			} else {
+
 				node.IsHealthy = true
 				node.LastSeen = time.Now()
 			}
 			if node.IsHealthy != wasHealthy {
 				changed = true
 			}
+			resp.Body.Close()
 		}
 		// Re-elect leader if current leader is not healthy
 		if leader == "" || (nodes[leader] != nil && !nodes[leader].IsHealthy) || changed {

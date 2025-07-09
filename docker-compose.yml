@@ -40,7 +40,6 @@ services:
     build:
       context: ./src/services/ingestor
     environment:
-      - NODE_ADDR=http://ingestor-1:4001
       - CLUSTER_MANAGER_ADDR=http://cluster-manager:5000
     depends_on:
       - cluster-manager
@@ -52,7 +51,6 @@ services:
     build:
       context: ./src/services/ingestor
     environment:
-      - NODE_ADDR=http://ingestor-2:4002
       - CLUSTER_MANAGER_ADDR=http://cluster-manager:5000
     depends_on:
       - cluster-manager
@@ -63,7 +61,8 @@ services:
   client-1:
     build:
       context: ./src/services/client
-    command: ["./client", "--batch", "2500", "--interval", "10"]
+    command:
+      ["./client", "--batch", "3000", "--interval", "10", "--format", "proto"]
     depends_on:
       - ingestor-1
       - ingestor-2
@@ -72,7 +71,7 @@ services:
     build:
       context: ./src/services/client
     command:
-      ["./client", "--batch", "2500", "--interval", "10", "--format", "raw"]
+      ["./client", "--batch", "3000", "--interval", "10", "--format", "proto"]
     depends_on:
       - ingestor-1
       - ingestor-2
