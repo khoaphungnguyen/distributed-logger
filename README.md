@@ -286,3 +286,12 @@ Compressed log files are written to:
 - 🛠️ **Pluggable Storage Backend (Ready):** The storage service is designed for easy extension to support alternative backends (e.g., S3, cloud storage, or distributed filesystems) in future milestones.
 - 🧪 **Stress-Tested at Scale:** The new architecture has been validated at 1M+ logs/sec with multiple clients and storage nodes, demonstrating robust performance and balanced resource usage.
 - 📊 **Dashboard Enhancements:** The dashboard and `/metrics` endpoint now report partition-level stats, storage node health, and end-to-end delivery rates for full operational visibility.
+
+### 🚀 Day 18 Milestones
+
+- 🔗 **Consistent Hashing for Log Distribution:** Implemented consistent hashing in the ingestor pipeline to ensure logs are evenly and predictably distributed across storage nodes, even as nodes are added or removed. This minimizes data movement and prevents hotspots, enabling seamless horizontal scaling.
+- 👑 **Raft-Based Leader Election:** Integrated Raft for robust, decentralized leader election among ingestor nodes. Only the elected leader coordinates cluster-wide tasks, while followers synchronize state and are ready to take over instantly if the leader fails.
+- ❤️ **Automated Health Checks:** The cluster manager continuously performs health checks on all registered nodes. If a node (including the leader) becomes unhealthy or unreachable, it is automatically removed from the active peer list, and a new leader is elected if necessary.
+- ⚖️ **Dynamic Rebalancing:** When storage nodes join or leave, the consistent hashing ring automatically rebalances log distribution with minimal disruption.
+- 🔄 **Seamless Failover:** Both clients and ingestors automatically detect leader changes and update their connections, ensuring uninterrupted log ingestion and replication. The system quickly recovers from node failures with zero manual intervention.
+- 🛡️ **High Availability:** The combination of Raft leader election and health checks ensures the cluster remains highly available and self-healing, even during rolling updates or unexpected outages.

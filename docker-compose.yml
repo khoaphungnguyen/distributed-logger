@@ -13,7 +13,6 @@ services:
     build:
       context: ./src/services/storage
     environment:
-      - STORAGE_NAME=storage-1
       - CLUSTER_MANAGER_ADDR=http://cluster-manager:5000
     depends_on:
       - cluster-manager
@@ -22,7 +21,6 @@ services:
     build:
       context: ./src/services/storage
     environment:
-      - STORAGE_NAME=storage-2
       - CLUSTER_MANAGER_ADDR=http://cluster-manager:5000
     depends_on:
       - cluster-manager
@@ -31,7 +29,6 @@ services:
     build:
       context: ./src/services/storage
     environment:
-      - STORAGE_NAME=storage-3
       - CLUSTER_MANAGER_ADDR=http://cluster-manager:5000
     depends_on:
       - cluster-manager
@@ -57,6 +54,16 @@ services:
       - storage-1
       - storage-2
       - storage-3
+  ingestor-3:
+    build:
+      context: ./src/services/ingestor
+    environment:
+      - CLUSTER_MANAGER_ADDR=http://cluster-manager:5000
+    depends_on:
+      - cluster-manager
+      - storage-1
+      - storage-2
+      - storage-3
 
   client-1:
     build:
@@ -66,6 +73,7 @@ services:
     depends_on:
       - ingestor-1
       - ingestor-2
+      - ingestor-3
 
   client-2:
     build:
@@ -75,3 +83,4 @@ services:
     depends_on:
       - ingestor-1
       - ingestor-2
+      - ingestor-3

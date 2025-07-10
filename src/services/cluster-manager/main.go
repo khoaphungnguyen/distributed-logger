@@ -25,7 +25,8 @@ type Node struct {
 var (
 	nodes      = make(map[string]*Node)
 	nodesMutex sync.Mutex
-	leader     string // Address of the current leader
+	leader     string // Address of the current leader (set by Raft)
+	term       int    // Election term number (set by Raft)
 )
 
 // Register a node (requires address and type)
@@ -46,13 +47,10 @@ func registerHandler(w http.ResponseWriter, r *http.Request) {
 		LastSeen:   time.Now(),
 		IsHealthy:  true,
 	}
-	if leader == "" || nodes[leader] == nil || !nodes[leader].IsHealthy {
-		leader = electLeader()
-	}
 	w.WriteHeader(http.StatusOK)
 }
 
-// Unregister a node and re-elect leader if needed
+// Unregister a node
 func unregisterHandler(w http.ResponseWriter, r *http.Request) {
 	var req Node
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Address == "" {
@@ -62,8 +60,10 @@ func unregisterHandler(w http.ResponseWriter, r *http.Request) {
 	nodesMutex.Lock()
 	defer nodesMutex.Unlock()
 	delete(nodes, req.Address)
+	// If the leader node is removed, clear leader info
 	if req.Address == leader {
-		leader = electLeader()
+		leader = ""
+		term = 0
 	}
 	w.WriteHeader(http.StatusOK)
 }
@@ -108,7 +108,7 @@ func ingestorNodesHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(list)
 }
 
-// Return the current leader (with ports if available)
+// Return the current leader (as set by Raft notification)
 func leaderHandler(w http.ResponseWriter, r *http.Request) {
 	nodesMutex.Lock()
 	defer nodesMutex.Unlock()
@@ -119,11 +119,13 @@ func leaderHandler(w http.ResponseWriter, r *http.Request) {
 	n := nodes[leader]
 	resp := struct {
 		Leader     string `json:"leader"`
+		Term       int    `json:"term"`
 		TCPPort    int    `json:"tcp_port,omitempty"`
 		UDPPort    int    `json:"udp_port,omitempty"`
 		HealthPort int    `json:"health_port,omitempty"`
 	}{
 		Leader:     n.Address,
+		Term:       term,
 		TCPPort:    n.TCPPort,
 		UDPPort:    n.UDPPort,
 		HealthPort: n.HealthPort,
@@ -158,22 +160,11 @@ func leaderHostHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(resp)
 }
 
-func electLeader() string {
-	var best string
-	for addr, n := range nodes {
-		if n.Type == "ingestor" && n.IsHealthy && (best == "" || addr < best) {
-			best = addr
-		}
-	}
-	return best
-}
-
-// Health check nodes and re-elect leader if needed
+// Health check nodes and clear leader if unhealthy
 func healthCheckNodes() {
 	for {
 		time.Sleep(1 * time.Second)
 		nodesMutex.Lock()
-		changed := false
 		for _, node := range nodes {
 			healthURL := node.Address
 			if node.HealthPort != 0 {
@@ -182,23 +173,20 @@ func healthCheckNodes() {
 			}
 			healthURL += "/cluster/health"
 			resp, err := http.Get(healthURL)
-
-			wasHealthy := node.IsHealthy
 			if err != nil || resp.StatusCode != 200 {
 				node.IsHealthy = false
 			} else {
-
 				node.IsHealthy = true
 				node.LastSeen = time.Now()
 			}
-			if node.IsHealthy != wasHealthy {
-				changed = true
+			if resp != nil && resp.Body != nil {
+				resp.Body.Close()
 			}
-			resp.Body.Close()
-		}
-		// Re-elect leader if current leader is not healthy
-		if leader == "" || (nodes[leader] != nil && !nodes[leader].IsHealthy) || changed {
-			leader = electLeader()
+			// If the leader node is unhealthy, clear leader info
+			if node.Address == leader && !node.IsHealthy {
+				leader = ""
+				term = 0
+			}
 		}
 		nodesMutex.Unlock()
 	}
@@ -217,7 +205,7 @@ func dashboardHandler(w http.ResponseWriter, r *http.Request) {
 	if leader == "" {
 		fmt.Fprint(w, "<p><b>No leader elected</b></p>")
 	} else {
-		fmt.Fprintf(w, "<p><b>Leader:</b> %s</p>", leader)
+		fmt.Fprintf(w, "<p><b>Leader:</b> %s (term %d)</p>", leader, term)
 	}
 	// Group nodes by type
 	types := map[string][]*Node{}
@@ -238,6 +226,27 @@ func dashboardHandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprint(w, "</body></html>")
 }
 
+// --- Raft Leader Notification Handler ---
+func raftLeaderHandler(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Address string `json:"address"`
+		Term    int    `json:"term"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Address == "" {
+		http.Error(w, "invalid request", 400)
+		return
+	}
+	nodesMutex.Lock()
+	defer nodesMutex.Unlock()
+	// Only update if term is newer or leader is empty
+	if req.Term > term || leader == "" || leader != req.Address {
+		leader = req.Address
+		term = req.Term
+		log.Printf("Cluster manager: Updated leader to %s (term %d)", leader, term)
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
 func main() {
 	http.HandleFunc("/", dashboardHandler)
 	http.HandleFunc("/nodes/register", registerHandler)
@@ -247,6 +256,7 @@ func main() {
 	http.HandleFunc("/ingestor-nodes", ingestorNodesHandler)
 	http.HandleFunc("/leader", leaderHandler)
 	http.HandleFunc("/leader-host", leaderHostHandler)
+	http.HandleFunc("/nodes/raft-leader", raftLeaderHandler)
 	go healthCheckNodes()
 	addr := os.Getenv("CLUSTER_MANAGER_ADDR")
 	if addr == "" {

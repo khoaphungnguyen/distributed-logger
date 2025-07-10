@@ -8,14 +8,17 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"hash/crc32"
 	"io/ioutil"
 	"log"
+	"math/rand"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"regexp"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -32,38 +35,240 @@ import (
 	"google.golang.org/protobuf/types/dynamicpb"
 )
 
+// ========== RAFT STATE & LEADER ELECTION ==========
+
+type RaftState string
+
 const (
-	partitionCount = 4 // or 12, tune for your CPU
-	batchSize      = 50000
-	batchFlushTime = 500 * time.Millisecond
+	StateFollower  RaftState = "follower"
+	StateCandidate RaftState = "candidate"
+	StateLeader    RaftState = "leader"
 )
 
 var (
-	partitionChans      [partitionCount]chan LogEntry
-	partitionBatchChans [partitionCount]chan []LogEntry
+	raftState      = StateFollower
+	raftTerm       = 0
+	votedFor       = ""
+	raftMutex      sync.Mutex
+	peerAddrs      []string
+	peerAddrsMutex sync.RWMutex
+
+	lastHeartbeat   = time.Now()
+	electionResetCh = make(chan struct{}, 1)
+	selfAddr        string // set at runtime
 )
 
-var httpClient = &http.Client{
-	Transport: &http.Transport{
-		MaxIdleConns:        1000,
-		MaxIdleConnsPerHost: 1000,
-		IdleConnTimeout:     90 * time.Second,
-	},
+// --- Raft Heartbeat Handler ---
+func heartbeatHandler(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Term   int    `json:"term"`
+		Leader string `json:"leader"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request", 400)
+		return
+	}
+	raftMutex.Lock()
+	defer raftMutex.Unlock()
+	if req.Term >= raftTerm {
+		raftTerm = req.Term
+		raftState = StateFollower
+		votedFor = req.Leader
+		select {
+		case electionResetCh <- struct{}{}:
+		default:
+		}
+	}
+	w.WriteHeader(http.StatusOK)
 }
 
-// --- Cluster Manager Integration ---
+// --- Raft Heartbeat Sender (Leader only) ---
+func sendHeartbeats() {
+	for {
+		raftMutex.Lock()
+		isLeader := raftState == StateLeader
+		term := raftTerm
+		raftMutex.Unlock()
+		if !isLeader {
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
+		peerAddrsMutex.RLock()
+		peers := append([]string{}, peerAddrs...)
+		peerAddrsMutex.RUnlock()
+		for _, peer := range peers {
+			go func(addr string) {
+				body, _ := json.Marshal(map[string]interface{}{
+					"term":   term,
+					"leader": selfAddr,
+				})
+				http.Post(addr+"/raft/heartbeat", "application/json", bytes.NewReader(body))
+			}(peer)
+		}
+		time.Sleep(75 * time.Millisecond)
+	}
+}
+
+// --- Raft Peer Discovery ---
+func updatePeers() {
+	resp, err := http.Get(clusterManagerAddr + "/ingestor-nodes")
+	if err != nil {
+		log.Printf("Failed to get peers: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+	var nodes []struct {
+		Address   string `json:"address"`
+		IsHealthy bool   `json:"is_healthy"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&nodes); err != nil {
+		log.Printf("Failed to decode peers: %v", err)
+		return
+	}
+	var addrs []string
+	for _, n := range nodes {
+		if n.IsHealthy && n.Address != selfAddr {
+			addrs = append(addrs, n.Address)
+		}
+	}
+	sort.Strings(addrs)
+	peerAddrsMutex.Lock()
+	if !equalStringSlices(peerAddrs, addrs) {
+		log.Printf("[RAFT] Peer list updated: %v", addrs)
+	}
+	peerAddrs = addrs
+	peerAddrsMutex.Unlock()
+}
+
+func equalStringSlices(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// --- Raft Election Loop ---
+func raftElectionLoop() {
+	timeoutBase := 1000
+	for {
+		timeout := time.Duration(timeoutBase+rand.Intn(1000)) * time.Millisecond
+		raftMutex.Lock()
+		state := raftState
+		raftMutex.Unlock()
+		if state == StateLeader {
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
+		select {
+		case <-electionResetCh:
+			// Heartbeat received, reset timer
+			continue
+		case <-time.After(timeout):
+			log.Printf("[RAFT] Election timeout, starting election (term %d)", raftTerm+1)
+		}
+		raftMutex.Lock()
+		raftTerm++
+		raftState = StateCandidate
+		votedFor = selfAddr
+		term := raftTerm
+		raftMutex.Unlock()
+
+		peerAddrsMutex.RLock()
+		peers := append([]string{}, peerAddrs...)
+		peerAddrsMutex.RUnlock()
+
+		var wg sync.WaitGroup
+		voteCh := make(chan bool, len(peers))
+		for _, peer := range peers {
+			wg.Add(1)
+			go func(addr string) {
+				defer wg.Done()
+				ok := requestVote(addr, term, selfAddr)
+				voteCh <- ok
+			}(peer)
+		}
+		wg.Wait()
+		close(voteCh)
+		votes := 1
+		for v := range voteCh {
+			if v {
+				votes++
+			}
+		}
+		if votes > (len(peers)+1)/2 {
+			raftMutex.Lock()
+			raftState = StateLeader
+			log.Printf("[RAFT] Became leader for term %d", raftTerm)
+			raftMutex.Unlock()
+			notifyClusterManagerOfLeadership()
+			go sendHeartbeats()
+		} else {
+			raftMutex.Lock()
+			raftState = StateFollower
+			raftMutex.Unlock()
+		}
+	}
+}
+
+// --- Raft Vote Handler ---
+func voteHandler(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Term      int    `json:"term"`
+		Candidate string `json:"candidate"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request", 400)
+		return
+	}
+	raftMutex.Lock()
+	defer raftMutex.Unlock()
+	granted := false
+	if req.Term > raftTerm {
+		raftTerm = req.Term
+		raftState = StateFollower
+		votedFor = ""
+	}
+	if req.Term == raftTerm && (votedFor == "" || votedFor == req.Candidate) {
+		granted = true
+		votedFor = req.Candidate
+	}
+	json.NewEncoder(w).Encode(map[string]bool{"voteGranted": granted})
+}
+
+// --- Raft Vote Client ---
+func requestVote(addr string, term int, candidate string) bool {
+	body, _ := json.Marshal(map[string]interface{}{
+		"term":      term,
+		"candidate": candidate,
+	})
+	resp, err := http.Post(addr+"/raft/vote", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	var res struct{ VoteGranted bool }
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+		return false
+	}
+	return res.VoteGranted
+}
+
+// ========== CLUSTER MANAGER INTEGRATION ==========
+
 var (
-	clusterManagerAddr = os.Getenv("CLUSTER_MANAGER_ADDR") // e.g. "http://cluster-manager:5000"
+	clusterManagerAddr = os.Getenv("CLUSTER_MANAGER_ADDR")
 	currentLeaderAddr  string
-
-	selfAddr string // set at runtime
-	isLeader bool
-
-	storageNodes      []string
-	storageNodesMutex sync.RWMutex
+	isLeader           bool
+	storageNodes       []string
+	storageNodesMutex  sync.RWMutex
+	storageRing        *hashRing
 )
 
-// Register with dynamic ports
 func registerWithClusterManager(addr string, tcpPort, udpPort, healthPort int) {
 	body, _ := json.Marshal(map[string]interface{}{
 		"address":     addr,
@@ -85,27 +290,12 @@ func unregisterWithClusterManager(addr string) {
 	log.Printf("Unregistered from cluster manager")
 }
 
-func updateLeaderAndPeers() {
-	resp, err := http.Get(clusterManagerAddr + "/leader")
-	if err != nil {
-		log.Printf("Failed to get leader: %v", err)
-		return
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		body, _ := ioutil.ReadAll(resp.Body)
-		log.Printf("Cluster manager /leader error: %s", string(body))
-		return
-	}
-	var data struct {
-		Leader string `json:"leader"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
-		log.Printf("Failed to decode leader response: %v", err)
-		return
-	}
-	currentLeaderAddr = data.Leader
-	isLeader = (data.Leader == selfAddr)
+func notifyClusterManagerOfLeadership() {
+	body, _ := json.Marshal(map[string]interface{}{
+		"address": selfAddr,
+		"term":    raftTerm,
+	})
+	http.Post(clusterManagerAddr+"/nodes/raft-leader", "application/json", bytes.NewReader(body))
 }
 
 func updateStorageNodes() {
@@ -131,18 +321,79 @@ func updateStorageNodes() {
 	}
 	storageNodesMutex.Lock()
 	storageNodes = addrs
+	storageRing = newHashRing(addrs, 100)
 	storageNodesMutex.Unlock()
 }
 
 func periodicallyUpdateClusterState() {
 	for {
-		updateLeaderAndPeers()
 		updateStorageNodes()
+		updatePeers()
 		time.Sleep(1 * time.Second)
 	}
 }
 
-// --- LogEntry struct ---
+// ========== CONSISTENT HASHING ==========
+
+type hashRing struct {
+	nodes    []string
+	replicas int
+	keys     []uint32
+	hashMap  map[uint32]string
+}
+
+func newHashRing(nodes []string, replicas int) *hashRing {
+	hr := &hashRing{
+		nodes:    nodes,
+		replicas: replicas,
+		hashMap:  make(map[uint32]string),
+	}
+	hr.generate()
+	return hr
+}
+
+func (hr *hashRing) generate() {
+	hr.keys = nil
+	hr.hashMap = make(map[uint32]string)
+	for _, node := range hr.nodes {
+		for i := 0; i < hr.replicas; i++ {
+			key := fmt.Sprintf("%s#%d", node, i)
+			hash := crc32Hash(key)
+			hr.keys = append(hr.keys, hash)
+			hr.hashMap[hash] = node
+		}
+	}
+	sort.Slice(hr.keys, func(i, j int) bool { return hr.keys[i] < hr.keys[j] })
+}
+
+func (hr *hashRing) getNode(key string) string {
+	if len(hr.keys) == 0 {
+		return ""
+	}
+	hash := crc32Hash(key)
+	idx := sort.Search(len(hr.keys), func(i int) bool { return hr.keys[i] >= hash })
+	if idx == len(hr.keys) {
+		idx = 0
+	}
+	return hr.hashMap[hr.keys[idx]]
+}
+
+func crc32Hash(s string) uint32 {
+	return crc32.ChecksumIEEE([]byte(s))
+}
+
+func pickStorageNode(entry LogEntry) string {
+	storageNodesMutex.RLock()
+	defer storageNodesMutex.RUnlock()
+	if storageRing == nil || len(storageNodes) == 0 {
+		return ""
+	}
+	key := entry.Service
+	return storageRing.getNode(key)
+}
+
+// ========== LOG ENTRY & VALIDATION ==========
+
 type LogEntry struct {
 	Timestamp   string `json:"timestamp"`
 	Level       string `json:"level"`
@@ -186,20 +437,113 @@ func (e *LogEntry) Validate() error {
 	return nil
 }
 
-// --- Storage Sharding ---
-func pickStorageNode(entry LogEntry) string {
-	storageNodesMutex.RLock()
-	defer storageNodesMutex.RUnlock()
-	if len(storageNodes) == 0 {
-		return ""
-	}
-	key := entry.Service + entry.Timestamp
-	h := sha1.Sum([]byte(key))
-	idx := int(h[0]) % len(storageNodes)
-	return storageNodes[idx]
+// ========== BATCHING & FORWARDING ==========
+
+const (
+	partitionCount = 4
+	batchSize      = 50000
+	batchFlushTime = 500 * time.Millisecond
+)
+
+var (
+	partitionChans      [partitionCount]chan LogEntry
+	partitionBatchChans [partitionCount]chan []LogEntry
+)
+
+var httpClient = &http.Client{
+	Transport: &http.Transport{
+		MaxIdleConns:        1000,
+		MaxIdleConnsPerHost: 1000,
+		IdleConnTimeout:     90 * time.Second,
+	},
 }
 
-// --- Metrics ---
+func partitionIndex(entry LogEntry) int {
+	h := sha1.Sum([]byte(entry.Service))
+	return int(h[0]) % partitionCount
+}
+
+func enqueueLog(entry LogEntry) {
+	if atomic.LoadInt32(&shuttingDown) == 1 {
+		return
+	}
+	idx := partitionIndex(entry)
+	select {
+	case partitionChans[idx] <- entry:
+	default:
+		atomic.AddInt64(&droppedLogs, 1)
+	}
+}
+
+func partitionBatchDispatcher(idx int) {
+	batch := make([]LogEntry, 0, batchSize)
+	timer := time.NewTimer(batchFlushTime)
+	flush := func() {
+		if len(batch) == 0 {
+			return
+		}
+		partitionBatchChans[idx] <- batch
+		batch = make([]LogEntry, 0, batchSize)
+	}
+	for {
+		select {
+		case entry := <-partitionChans[idx]:
+			batch = append(batch, entry)
+			if len(batch) >= batchSize {
+				flush()
+				if !timer.Stop() {
+					<-timer.C
+				}
+				timer.Reset(batchFlushTime)
+			}
+		case <-timer.C:
+			flush()
+			timer.Reset(batchFlushTime)
+		}
+	}
+}
+
+func partitionBatchWorker(idx int) {
+	for entries := range partitionBatchChans[idx] {
+		nodeBatches := make(map[string][]LogEntry)
+		for _, entry := range entries {
+			addr := pickStorageNode(entry)
+			if addr == "" {
+				log.Printf("Partition %d: No available storage node for entry: %+v", idx, entry)
+				continue
+			}
+			nodeBatches[addr] = append(nodeBatches[addr], entry)
+		}
+		for addr, batch := range nodeBatches {
+			if err := forwardBatchToStorage(addr, batch); err != nil {
+				log.Printf("Partition %d: Failed to forward batch to %s: %v", idx, addr, err)
+			}
+		}
+	}
+}
+
+func forwardBatchToStorage(addr string, entries []LogEntry) error {
+	if addr == "" || len(entries) == 0 {
+		return nil
+	}
+	url := addr + "/ingest/batch"
+	b, _ := json.Marshal(entries)
+	resp, err := httpClient.Post(url, "application/json", bytes.NewReader(b))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := ioutil.ReadAll(resp.Body)
+		return fmt.Errorf("storage error: %s", string(body))
+	}
+	atomic.AddInt64(&processCount, int64(len(entries)))
+	atomic.AddInt64(&totalBytes, int64(len(b)))
+	return nil
+}
+
+// ========== METRICS & DASHBOARD ==========
+
 type MetricsSnapshot struct {
 	LogsPerSec   int64
 	MBPerSec     float64
@@ -218,7 +562,7 @@ var (
 		"syslog":   {},
 		"journald": {},
 	}
-	sampleLimit = 3 // Number of samples to keep per format
+	sampleLimit = 3
 )
 
 var (
@@ -240,71 +584,7 @@ var (
 	}
 )
 
-// --- Schema Registry Integration ---
-var (
-	jsonSchema   *gojsonschema.Schema
-	avroCodec    avro.Schema
-	protoMsgDesc protoreflect.MessageDescriptor
-)
-
-func fetchAndCacheSchemas() {
-	// JSON Schema
-	resp, err := http.Get("http://schema-validator:8000/schema/get?format=json&name=LogEntry")
-	if err != nil {
-		log.Fatalf("Failed to fetch JSON schema: %v", err)
-	}
-	defer resp.Body.Close()
-	var result struct {
-		Schema string `json:"schema"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		log.Fatalf("Failed to decode JSON schema: %v", err)
-	}
-	jsonSchema, err = gojsonschema.NewSchema(gojsonschema.NewStringLoader(result.Schema))
-	if err != nil {
-		log.Fatalf("Failed to parse JSON schema: %v", err)
-	}
-
-	// Avro Schema
-	resp, err = http.Get("http://schema-validator:8000/schema/get?format=avro&name=LogEntry")
-	if err != nil {
-		log.Fatalf("Failed to fetch Avro schema: %v", err)
-	}
-	defer resp.Body.Close()
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		log.Fatalf("Failed to decode Avro schema: %v", err)
-	}
-	avroCodec, err = avro.Parse(result.Schema)
-	if err != nil {
-		log.Fatalf("Failed to parse Avro schema: %v", err)
-	}
-
-	// Protobuf Descriptor
-	resp, err = http.Get("http://schema-validator:8000/schema/descriptor?name=LogEntry")
-	if err != nil {
-		log.Fatalf("Failed to fetch proto descriptor: %v", err)
-	}
-	defer resp.Body.Close()
-	descBytes, _ := ioutil.ReadAll(resp.Body)
-	protoDesc := &descriptorpb.FileDescriptorSet{}
-	if err := proto.Unmarshal(descBytes, protoDesc); err != nil {
-		log.Fatalf("Failed to unmarshal proto descriptor: %v", err)
-	}
-	for _, fdProto := range protoDesc.File {
-		fd, err := protodesc.NewFile(fdProto, nil)
-		if err != nil {
-			continue
-		}
-		if md := fd.Messages().ByName("LogEntry"); md != nil {
-			protoMsgDesc = md
-			break
-		}
-	}
-}
-
-// --- Metrics ---
 func metricsLogger() {
-
 	for range rateTicker.C {
 		metricsMutex.Lock()
 		rate := atomic.LoadInt64(&processCount)
@@ -360,10 +640,17 @@ func recordSample(format string, entry LogEntry) {
 	sampleLogs[format] = lines
 }
 
-// --- HTTP Dashboard ---
+func incrementFormatCount(format string) {
+	if c, ok := formatCounts[format]; ok {
+		atomic.AddInt64(c, 1)
+	}
+}
+
 func startHTTPServer() {
 	mux := http.NewServeMux()
 	mux.Handle("/", http.FileServer(http.Dir("./static")))
+	mux.HandleFunc("/raft/vote", voteHandler)
+	mux.HandleFunc("/raft/heartbeat", heartbeatHandler)
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
 		metricsMutex.Lock()
 		snap := lastMetrics
@@ -379,7 +666,6 @@ func startHTTPServer() {
 		for k, v := range snap.FormatCounts {
 			fmt.Fprintf(w, `,"%s":%d`, k, v)
 		}
-		// Add samples
 		fmt.Fprintf(w, `,"samples":{`)
 		first := true
 		for k, v := range sampleLogs {
@@ -401,7 +687,7 @@ func startHTTPServer() {
 	server := &http.Server{
 		Addr:         ":3000",
 		Handler:      mux,
-		IdleTimeout:  10 * time.Second, // Close idle connections after 10s
+		IdleTimeout:  10 * time.Second,
 		ReadTimeout:  5 * time.Second,
 		WriteTimeout: 10 * time.Second,
 	}
@@ -409,7 +695,8 @@ func startHTTPServer() {
 	server.ListenAndServe()
 }
 
-// --- Universal TCP server with dynamic port ---
+// ========== UNIVERSAL LOG INGESTION SERVERS ==========
+
 func startTCPServerUniversalOnListener(listener net.Listener) {
 	cert, err := tls.LoadX509KeyPair("./certs/cert.pem", "./certs/key.pem")
 	if err != nil {
@@ -425,15 +712,12 @@ func startTCPServerUniversalOnListener(listener net.Listener) {
 			log.Printf("TCP Accept error: %v", err)
 			continue
 		}
-		// Limit concurrent connections to avoid goroutine explosion
 		go handleUniversalConnection(conn)
 	}
 }
 
-// --- JSON UDP server with dynamic port ---
 func startUDPServerOnConn(conn *net.UDPConn) {
 	log.Printf("UDP log ingestor listening on %s", conn.LocalAddr().String())
-
 	buf := make([]byte, 65535)
 	for {
 		n, _, err := conn.ReadFromUDP(buf)
@@ -441,7 +725,6 @@ func startUDPServerOnConn(conn *net.UDPConn) {
 			log.Printf("UDP read error: %v", err)
 			continue
 		}
-
 		scanner := bufio.NewScanner(bytes.NewReader(buf[:n]))
 		for scanner.Scan() {
 			start := time.Now()
@@ -461,7 +744,6 @@ func startUDPServerOnConn(conn *net.UDPConn) {
 			entry.AppVersion = os.Getenv("APP_VERSION")
 			entry.ReceivedAt = time.Now().UTC().Format(time.RFC3339)
 			recordSample("json", entry)
-
 			enqueueLog(entry)
 			recordLatency(time.Since(start))
 			incrementFormatCount("json")
@@ -472,18 +754,14 @@ func startUDPServerOnConn(conn *net.UDPConn) {
 	}
 }
 
-// --- Universal Handler ---
 func handleUniversalConnection(conn net.Conn) {
 	defer conn.Close()
 	buf := make([]byte, 0, 64*1024)
 	tmp := make([]byte, 64*1024)
 	for {
-
-		// Read header + length
 		for len(buf) < 5 {
 			n, err := conn.Read(tmp)
 			if err != nil {
-				// If timeout, connection will close and goroutine will exit
 				return
 			}
 			buf = append(buf, tmp[:n]...)
@@ -594,11 +872,7 @@ func handleUniversalConnection(conn net.Conn) {
 	}
 }
 
-func incrementFormatCount(format string) {
-	if c, ok := formatCounts[format]; ok {
-		atomic.AddInt64(c, 1)
-	}
-}
+// ========== LOG FORMAT PARSING HELPERS ==========
 
 func toString(v interface{}) string {
 	if v == nil {
@@ -623,7 +897,6 @@ func parseRawLog(line string) LogEntry {
 		service = strings.Trim(parts[2], "[]")
 		msg = parts[3]
 	} else {
-		// Try to parse as just a message, fallback to now
 		log.Printf("parseRawLog: unexpected format: %q", line)
 		ts = time.Now().UTC().Format(time.RFC3339)
 		level = "INFO"
@@ -642,7 +915,6 @@ func detectLogFormat(line string) string {
 	if strings.Contains(line, "journal") || strings.Contains(line, "_SYSTEMD_UNIT") {
 		return "journald"
 	}
-	// Syslog: starts with <PRI>Mon ... (e.g., <6>Jul  2 17:00:01 ...)
 	if len(line) > 5 && line[0] == '<' {
 		for i := 1; i < len(line) && i < 5; i++ {
 			if line[i] == '>' && i > 1 {
@@ -757,18 +1029,18 @@ func parseJournaldTimestamp(v interface{}) string {
 	}
 }
 
-// --- Main ---
+// ========== MAIN ==========
+
 var shuttingDown int32
 
 func main() {
-	// Pick random TCP port for log ingestion
+	rand.Seed(time.Now().UnixNano() + int64(os.Getpid()))
 	tcpListener, err := net.Listen("tcp", ":0")
 	if err != nil {
 		log.Fatalf("Failed to listen on TCP: %v", err)
 	}
 	tcpPort := tcpListener.Addr().(*net.TCPAddr).Port
 
-	// Pick random UDP port for log ingestion
 	udpAddr, err := net.ResolveUDPAddr("udp", ":0")
 	if err != nil {
 		log.Fatalf("Failed to resolve UDP: %v", err)
@@ -779,7 +1051,6 @@ func main() {
 	}
 	udpPort := udpConn.LocalAddr().(*net.UDPAddr).Port
 
-	// Pick random port for cluster HTTP health endpoint
 	healthListener, err := net.Listen("tcp", ":0")
 	if err != nil {
 		log.Fatalf("Failed to listen for health endpoint: %v", err)
@@ -789,10 +1060,10 @@ func main() {
 	hostname, _ := os.Hostname()
 	selfAddr = fmt.Sprintf("http://%s", hostname)
 
-	// Register all ports (including health_port)
 	registerWithClusterManager(selfAddr, tcpPort, udpPort, healthPort)
 
 	go periodicallyUpdateClusterState()
+	go raftElectionLoop()
 	go startTCPServerUniversalOnListener(tcpListener)
 	go startUDPServerOnConn(udpConn)
 	go startHTTPServer()
@@ -804,13 +1075,75 @@ func main() {
 		partitionBatchChans[i] = make(chan []LogEntry)
 		go partitionBatchDispatcher(i)
 		go partitionBatchWorker(i)
-
 	}
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 	<-sigChan
 	atomic.StoreInt32(&shuttingDown, 1)
+	unregisterWithClusterManager(selfAddr)
 	log.Println("Shutting down...")
+}
+
+// --- Schema Registry Integration ---
+var (
+	jsonSchema   *gojsonschema.Schema
+	avroCodec    avro.Schema
+	protoMsgDesc protoreflect.MessageDescriptor
+)
+
+func fetchAndCacheSchemas() {
+	// JSON Schema
+	resp, err := http.Get("http://schema-validator:8000/schema/get?format=json&name=LogEntry")
+	if err != nil {
+		log.Fatalf("Failed to fetch JSON schema: %v", err)
+	}
+	defer resp.Body.Close()
+	var result struct {
+		Schema string `json:"schema"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		log.Fatalf("Failed to decode JSON schema: %v", err)
+	}
+	jsonSchema, err = gojsonschema.NewSchema(gojsonschema.NewStringLoader(result.Schema))
+	if err != nil {
+		log.Fatalf("Failed to parse JSON schema: %v", err)
+	}
+
+	// Avro Schema
+	resp, err = http.Get("http://schema-validator:8000/schema/get?format=avro&name=LogEntry")
+	if err != nil {
+		log.Fatalf("Failed to fetch Avro schema: %v", err)
+	}
+	defer resp.Body.Close()
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		log.Fatalf("Failed to decode Avro schema: %v", err)
+	}
+	avroCodec, err = avro.Parse(result.Schema)
+	if err != nil {
+		log.Fatalf("Failed to parse Avro schema: %v", err)
+	}
+
+	// Protobuf Descriptor
+	resp, err = http.Get("http://schema-validator:8000/schema/descriptor?name=LogEntry")
+	if err != nil {
+		log.Fatalf("Failed to fetch proto descriptor: %v", err)
+	}
+	defer resp.Body.Close()
+	descBytes, _ := ioutil.ReadAll(resp.Body)
+	protoDesc := &descriptorpb.FileDescriptorSet{}
+	if err := proto.Unmarshal(descBytes, protoDesc); err != nil {
+		log.Fatalf("Failed to unmarshal proto descriptor: %v", err)
+	}
+	for _, fdProto := range protoDesc.File {
+		fd, err := protodesc.NewFile(fdProto, nil)
+		if err != nil {
+			continue
+		}
+		if md := fd.Messages().ByName("LogEntry"); md != nil {
+			protoMsgDesc = md
+			break
+		}
+	}
 }
 
 func startClusterHTTPServerOnListener(listener net.Listener) {
@@ -822,92 +1155,12 @@ func startClusterHTTPServerOnListener(listener net.Listener) {
 	log.Printf("Cluster HTTP endpoints available at %s (listening on %s)", selfAddr, listener.Addr().String())
 	server := &http.Server{
 		Handler:      mux,
-		IdleTimeout:  5 * time.Second, // Close idle connections after 5s
-		ReadTimeout:  2 * time.Second, // Optional: limit read time
-		WriteTimeout: 2 * time.Second, // Optional: limit write time
+		IdleTimeout:  5 * time.Second,
+		ReadTimeout:  2 * time.Second,
+		WriteTimeout: 2 * time.Second,
 	}
 	err := server.Serve(listener)
 	if err != nil {
 		log.Fatalf("Failed to start cluster HTTP server: %v", err)
 	}
-}
-
-// --- Enqueue Functions ---
-func partitionIndex(entry LogEntry) int {
-	// Example: hash by service name
-	h := sha1.Sum([]byte(entry.Service))
-	return int(h[0]) % partitionCount
-}
-
-func enqueueLog(entry LogEntry) {
-	if atomic.LoadInt32(&shuttingDown) == 1 {
-		return
-	}
-	idx := partitionIndex(entry)
-	select {
-	case partitionChans[idx] <- entry:
-	default:
-		atomic.AddInt64(&droppedLogs, 1)
-	}
-}
-
-func partitionBatchDispatcher(idx int) {
-	batch := make([]LogEntry, 0, batchSize)
-	timer := time.NewTimer(batchFlushTime)
-	flush := func() {
-		if len(batch) == 0 {
-			return
-		}
-		partitionBatchChans[idx] <- batch
-		batch = make([]LogEntry, 0, batchSize) // allocate a new slice for the next batch
-	}
-	for {
-		select {
-		case entry := <-partitionChans[idx]:
-			batch = append(batch, entry)
-			if len(batch) >= batchSize {
-				flush()
-				if !timer.Stop() {
-					<-timer.C
-				}
-				timer.Reset(batchFlushTime)
-			}
-		case <-timer.C:
-			flush()
-			timer.Reset(batchFlushTime)
-		}
-	}
-}
-
-func partitionBatchWorker(idx int) {
-	for entries := range partitionBatchChans[idx] {
-		if err := forwardBatchToStorage(entries); err != nil {
-			log.Printf("Partition %d: Failed to forward batch: %v", idx, err)
-		}
-	}
-}
-
-// Forward a batch of logs to the storage nodes
-func forwardBatchToStorage(entries []LogEntry) error {
-	addr := ""
-	if len(entries) > 0 {
-		addr = pickStorageNode(entries[0])
-	}
-	if addr == "" {
-		return fmt.Errorf("no available storage nodes")
-	}
-	url := addr + "/ingest/batch"
-	b, _ := json.Marshal(entries)
-	resp, err := httpClient.Post(url, "application/json", bytes.NewReader(b))
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		body, _ := ioutil.ReadAll(resp.Body)
-		return fmt.Errorf("storage error: %s", string(body))
-	}
-	atomic.AddInt64(&processCount, int64(len(entries)))
-	atomic.AddInt64(&totalBytes, int64(len(b)))
-	return nil
 }

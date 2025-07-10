@@ -12,7 +12,9 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -33,6 +35,40 @@ var (
 	clusterManagerAddr = os.Getenv("CLUSTER_MANAGER_ADDR")
 	selfAddr           string
 )
+
+var (
+	processCount int64
+	totalBytes   int64
+	totalLatency int64
+	latencyCount int64
+	droppedLogs  int64
+	rateTicker   = time.NewTicker(1 * time.Second)
+)
+
+// Add this function:
+func metricsLogger() {
+	for range rateTicker.C {
+		rate := atomic.LoadInt64(&processCount)
+		bytesPerSec := atomic.LoadInt64(&totalBytes)
+		totalLat := atomic.LoadInt64(&totalLatency)
+		latCount := atomic.LoadInt64(&latencyCount)
+		dropped := atomic.LoadInt64(&droppedLogs)
+
+		avgLatency := float64(0)
+		if latCount > 0 {
+			avgLatency = float64(totalLat) / float64(latCount)
+		}
+		numGoroutines := runtime.NumGoroutine()
+
+		log.Printf("[METRIC] Logs/sec: %d, MB/s: %.2f, Latency: %.2fµs, Goroutines: %d, Dropped: %d",
+			rate, float64(bytesPerSec)/(1024*1024), avgLatency, numGoroutines, dropped)
+
+		atomic.StoreInt64(&processCount, 0)
+		atomic.StoreInt64(&totalBytes, 0)
+		atomic.StoreInt64(&totalLatency, 0)
+		atomic.StoreInt64(&latencyCount, 0)
+	}
+}
 
 func getPartitionKey(entry LogEntry) string {
 	t := time.Now()
@@ -56,7 +92,9 @@ func getPartitionLock(partition string) *sync.Mutex {
 	return l
 }
 
+// Update writeLog:
 func writeLog(entry LogEntry) error {
+	start := time.Now()
 	partition := entry.PartitionKey
 	if partition == "" {
 		partition = getPartitionKey(entry)
@@ -70,17 +108,27 @@ func writeLog(entry LogEntry) error {
 		var err error
 		f, err = os.OpenFile(filePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 		if err != nil {
+			atomic.AddInt64(&droppedLogs, 1)
 			return err
 		}
 		partitionMap[partition] = f
 	}
 	b, _ := json.Marshal(entry)
 	_, err := f.Write(append(b, '\n'))
+	if err == nil {
+		atomic.AddInt64(&processCount, 1)
+		atomic.AddInt64(&totalBytes, int64(len(b)))
+		atomic.AddInt64(&totalLatency, time.Since(start).Microseconds())
+		atomic.AddInt64(&latencyCount, 1)
+	} else {
+		atomic.AddInt64(&droppedLogs, 1)
+	}
 	return err
 }
 
+// Update writeLogBatch:
 func writeLogBatch(entries []LogEntry) error {
-	// Group entries by partition
+	start := time.Now()
 	partitioned := make(map[string][]LogEntry)
 	for _, entry := range entries {
 		partition := entry.PartitionKey
@@ -89,7 +137,6 @@ func writeLogBatch(entries []LogEntry) error {
 		}
 		partitioned[partition] = append(partitioned[partition], entry)
 	}
-	// Write each partition in batch
 	for partition, group := range partitioned {
 		lock := getPartitionLock(partition)
 		lock.Lock()
@@ -100,6 +147,7 @@ func writeLogBatch(entries []LogEntry) error {
 			f, err = os.OpenFile(filePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 			if err != nil {
 				lock.Unlock()
+				atomic.AddInt64(&droppedLogs, int64(len(group)))
 				return err
 			}
 			partitionMap[partition] = f
@@ -110,7 +158,14 @@ func writeLogBatch(entries []LogEntry) error {
 			buf.Write(b)
 			buf.WriteByte('\n')
 		}
-		if _, err := f.Write(buf.Bytes()); err != nil {
+		n, err := f.Write(buf.Bytes())
+		if err == nil {
+			atomic.AddInt64(&processCount, int64(len(group)))
+			atomic.AddInt64(&totalBytes, int64(n))
+			atomic.AddInt64(&totalLatency, time.Since(start).Microseconds())
+			atomic.AddInt64(&latencyCount, int64(len(group)))
+		} else {
+			atomic.AddInt64(&droppedLogs, int64(len(group)))
 			lock.Unlock()
 			return err
 		}
@@ -236,6 +291,7 @@ func unregisterWithClusterManager(addr string) {
 func main() {
 	os.MkdirAll(dataDir, 0755)
 	go compressOldFiles(3)
+	//go metricsLogger()
 	http.HandleFunc("/ingest", logHandler)
 	http.HandleFunc("/ingest/batch", batchLogHandler)
 	http.HandleFunc("/query", queryHandler)
@@ -243,7 +299,11 @@ func main() {
 
 	storageName := os.Getenv("STORAGE_NAME")
 	if storageName == "" {
-		log.Fatal("STORAGE_NAME must be set")
+		hostname, err := os.Hostname()
+		if err != nil {
+			log.Fatal("STORAGE_NAME must be set and hostname could not be determined")
+		}
+		storageName = hostname
 	}
 
 	ln, err := net.Listen("tcp", ":0") // random port
