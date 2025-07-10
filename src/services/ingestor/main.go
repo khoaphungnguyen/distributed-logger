@@ -296,7 +296,7 @@ func unregisterWithClusterManager(addr string) {
 
 func notifyClusterManagerOfLeadership() {
 	body, _ := json.Marshal(map[string]interface{}{
-		"address": selfAddr + fmt.Sprintf(":%d", healthPort),
+		"address": selfAddr,
 		"term":    raftTerm,
 	})
 	http.Post(clusterManagerAddr+"/nodes/raft-leader", "application/json", bytes.NewReader(body))

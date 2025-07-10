@@ -205,6 +205,7 @@ func discoverLeaderWithPorts(clusterManagerURL string) (string, int, int, error)
 			continue
 		}
 		host := u.Hostname()
+		log.Println("Discovered leader:", host, "TCP port:", info.TCPPort, "UDP port:", info.UDPPort)
 		return host, info.TCPPort, info.UDPPort, nil
 	}
 	return "", 0, 0, fmt.Errorf("could not discover leader after retries")
@@ -216,6 +217,7 @@ func main() {
 
 	// Discover leader host and ports before connecting
 	leaderHost, tcpPort, udpPort, err := discoverLeaderWithPorts(clusterManagerURL)
+	log.Println("Leader discovery result:", leaderHost, tcpPort, udpPort)
 	if leaderHost == "" || tcpPort == 0 || udpPort == 0 {
 		log.Fatalf("Could not discover leader host/ports: %v", err)
 	}

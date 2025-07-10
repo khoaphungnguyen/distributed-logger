@@ -134,32 +134,6 @@ func leaderHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(resp)
 }
 
-// Return only the hostname (no port) for the current leader
-func leaderHostHandler(w http.ResponseWriter, r *http.Request) {
-	nodesMutex.Lock()
-	defer nodesMutex.Unlock()
-	if leader == "" {
-		http.Error(w, "no leader", 404)
-		return
-	}
-	u, err := url.Parse(leader)
-	if err != nil {
-		http.Error(w, "Invalid leader address", 500)
-		return
-	}
-	hostOnly := u.Hostname()
-	scheme := u.Scheme
-	resp := struct {
-		Host string `json:"host"`
-		URL  string `json:"url"`
-	}{
-		Host: hostOnly,
-		URL:  fmt.Sprintf("%s://%s", scheme, hostOnly),
-	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
-}
-
 // Health check nodes and clear leader if unhealthy
 func healthCheckNodes() {
 	for {
@@ -255,7 +229,6 @@ func main() {
 	http.HandleFunc("/storage-nodes", storageNodesHandler)
 	http.HandleFunc("/ingestor-nodes", ingestorNodesHandler)
 	http.HandleFunc("/leader", leaderHandler)
-	http.HandleFunc("/leader-host", leaderHostHandler)
 	http.HandleFunc("/nodes/raft-leader", raftLeaderHandler)
 	go healthCheckNodes()
 	addr := os.Getenv("CLUSTER_MANAGER_ADDR")
