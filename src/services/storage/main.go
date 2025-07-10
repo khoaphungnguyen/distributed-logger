@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"compress/gzip"
 	"encoding/json"
@@ -13,6 +14,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -20,32 +22,73 @@ import (
 )
 
 type LogEntry struct {
-	Timestamp    string `json:"timestamp"`
-	Level        string `json:"level"`
-	Message      string `json:"message"`
-	Service      string `json:"service"`
-	PartitionKey string `json:"partition_key,omitempty"`
+	Timestamp  string `json:"timestamp"`
+	Level      string `json:"level"`
+	Message    string `json:"message"`
+	Service    string `json:"service"`
+	Hostname   string `json:"hostname,omitempty"`
+	AppVersion string `json:"app_version,omitempty"`
 }
 
 var (
 	dataDir            = "./data"
-	partitionMap       = make(map[string]*os.File) // partitionKey -> file
-	partitionLocks     = make(map[string]*sync.Mutex)
-	locksMu            sync.Mutex
+	partitionIndex     = make(map[string][]string) // service -> []partition files
+	indexMu            sync.RWMutex
 	clusterManagerAddr = os.Getenv("CLUSTER_MANAGER_ADDR")
 	selfAddr           string
-)
 
-var (
 	processCount int64
 	totalBytes   int64
 	totalLatency int64
 	latencyCount int64
 	droppedLogs  int64
 	rateTicker   = time.NewTicker(1 * time.Second)
+
+	partitionBuffers = make(map[string]chan LogEntry)
+	bufferMu         sync.Mutex
 )
 
-// Add this function:
+func getPartitionBuffer(partition string) chan LogEntry {
+	bufferMu.Lock()
+	defer bufferMu.Unlock()
+	buf, ok := partitionBuffers[partition]
+	if !ok {
+		buf = make(chan LogEntry, 1000)
+		partitionBuffers[partition] = buf
+		go partitionBufferWriter(partition, buf)
+		// --- Add this to update the index ---
+		parts := strings.Split(partition, "_")
+		if len(parts) >= 2 {
+			service := parts[0]
+			filePath := filepath.Join(dataDir, fmt.Sprintf("partition_%s.log", partition))
+			addToPartitionIndex(service, filePath)
+		}
+	}
+	return buf
+}
+func partitionBufferWriter(partition string, buf chan LogEntry) {
+	filePath := filepath.Join(dataDir, fmt.Sprintf("partition_%s.log", partition))
+	f, err := os.OpenFile(filePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		log.Printf("Failed to open file for partition %s: %v", partition, err)
+		return
+	}
+	defer f.Close()
+	encoder := json.NewEncoder(f)
+	for entry := range buf {
+		encoder.Encode(entry)
+		atomic.AddInt64(&processCount, 1)
+	}
+}
+
+func writeLogBatchBuffered(entries []LogEntry) {
+	for _, entry := range entries {
+		partition := getPartitionKey(entry)
+		buf := getPartitionBuffer(partition)
+		buf <- entry
+	}
+}
+
 func metricsLogger() {
 	for range rateTicker.C {
 		rate := atomic.LoadInt64(&processCount)
@@ -70,6 +113,33 @@ func metricsLogger() {
 	}
 }
 
+func buildPartitionIndex() {
+	indexMu.Lock()
+	defer indexMu.Unlock()
+	partitionIndex = make(map[string][]string)
+	files, _ := filepath.Glob(filepath.Join(dataDir, "partition_*.log"))
+	for _, file := range files {
+		base := filepath.Base(file)
+		parts := strings.Split(base, "_")
+		if len(parts) < 3 {
+			continue
+		}
+		service := parts[1]
+		partitionIndex[service] = append(partitionIndex[service], file)
+	}
+}
+
+func addToPartitionIndex(service, file string) {
+	indexMu.Lock()
+	defer indexMu.Unlock()
+	for _, f := range partitionIndex[service] {
+		if f == file {
+			return // already indexed
+		}
+	}
+	partitionIndex[service] = append(partitionIndex[service], file)
+}
+
 func getPartitionKey(entry LogEntry) string {
 	t := time.Now()
 	if entry.Timestamp != "" {
@@ -81,146 +151,158 @@ func getPartitionKey(entry LogEntry) string {
 	return fmt.Sprintf("%s_%s", entry.Service, t.Format("2006-01-02-15"))
 }
 
-func getPartitionLock(partition string) *sync.Mutex {
-	locksMu.Lock()
-	defer locksMu.Unlock()
-	l, ok := partitionLocks[partition]
-	if !ok {
-		l = &sync.Mutex{}
-		partitionLocks[partition] = l
-	}
-	return l
-}
-
-// Update writeLog:
-func writeLog(entry LogEntry) error {
-	start := time.Now()
-	partition := entry.PartitionKey
-	if partition == "" {
-		partition = getPartitionKey(entry)
-	}
-	lock := getPartitionLock(partition)
-	lock.Lock()
-	defer lock.Unlock()
-	f, ok := partitionMap[partition]
-	if !ok {
-		filePath := filepath.Join(dataDir, fmt.Sprintf("partition_%s.log", partition))
-		var err error
-		f, err = os.OpenFile(filePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-		if err != nil {
-			atomic.AddInt64(&droppedLogs, 1)
-			return err
-		}
-		partitionMap[partition] = f
-	}
-	b, _ := json.Marshal(entry)
-	_, err := f.Write(append(b, '\n'))
-	if err == nil {
-		atomic.AddInt64(&processCount, 1)
-		atomic.AddInt64(&totalBytes, int64(len(b)))
-		atomic.AddInt64(&totalLatency, time.Since(start).Microseconds())
-		atomic.AddInt64(&latencyCount, 1)
-	} else {
-		atomic.AddInt64(&droppedLogs, 1)
-	}
-	return err
-}
-
-// Update writeLogBatch:
-func writeLogBatch(entries []LogEntry) error {
-	start := time.Now()
-	partitioned := make(map[string][]LogEntry)
-	for _, entry := range entries {
-		partition := entry.PartitionKey
-		if partition == "" {
-			partition = getPartitionKey(entry)
-		}
-		partitioned[partition] = append(partitioned[partition], entry)
-	}
-	for partition, group := range partitioned {
-		lock := getPartitionLock(partition)
-		lock.Lock()
-		f, ok := partitionMap[partition]
-		if !ok {
-			filePath := filepath.Join(dataDir, fmt.Sprintf("partition_%s.log", partition))
-			var err error
-			f, err = os.OpenFile(filePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-			if err != nil {
-				lock.Unlock()
-				atomic.AddInt64(&droppedLogs, int64(len(group)))
-				return err
-			}
-			partitionMap[partition] = f
-		}
-		var buf bytes.Buffer
-		for _, entry := range group {
-			b, _ := json.Marshal(entry)
-			buf.Write(b)
-			buf.WriteByte('\n')
-		}
-		n, err := f.Write(buf.Bytes())
-		if err == nil {
-			atomic.AddInt64(&processCount, int64(len(group)))
-			atomic.AddInt64(&totalBytes, int64(n))
-			atomic.AddInt64(&totalLatency, time.Since(start).Microseconds())
-			atomic.AddInt64(&latencyCount, int64(len(group)))
-		} else {
-			atomic.AddInt64(&droppedLogs, int64(len(group)))
-			lock.Unlock()
-			return err
-		}
-		lock.Unlock()
-	}
-	return nil
-}
-
-func logHandler(w http.ResponseWriter, r *http.Request) {
-	var entry LogEntry
-	if err := json.NewDecoder(r.Body).Decode(&entry); err != nil {
-		http.Error(w, "Invalid log entry", 400)
-		return
-	}
-	if entry.PartitionKey == "" {
-		entry.PartitionKey = getPartitionKey(entry)
-	}
-	if err := writeLog(entry); err != nil {
-		http.Error(w, "Failed to write log", 500)
-		return
-	}
-	w.WriteHeader(http.StatusOK)
-}
-
 func batchLogHandler(w http.ResponseWriter, r *http.Request) {
 	var entries []LogEntry
 	if err := json.NewDecoder(r.Body).Decode(&entries); err != nil {
 		http.Error(w, "Invalid batch payload", 400)
 		return
 	}
-	if err := writeLogBatch(entries); err != nil {
-		http.Error(w, "Failed to write batch", 500)
-		return
-	}
+	writeLogBatchBuffered(entries)
 	w.WriteHeader(http.StatusOK)
 }
 
 func queryHandler(w http.ResponseWriter, r *http.Request) {
-	service := r.URL.Query().Get("service")
-	partition := r.URL.Query().Get("partition")
-	if service == "" || partition == "" {
-		http.Error(w, "Missing service or partition", 400)
+	if r.Method != http.MethodPost {
+		http.Error(w, "Only POST supported", http.StatusMethodNotAllowed)
 		return
 	}
-	filePath := filepath.Join(dataDir, fmt.Sprintf("partition_%s_%s.log", service, partition))
-	if _, err := os.Stat(filePath); os.IsNotExist(err) {
-		filePath += ".gz"
-	}
-	f, err := os.Open(filePath)
-	if err != nil {
-		http.Error(w, "Partition not found", 404)
+	var req QueryRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
-	defer f.Close()
-	http.ServeContent(w, r, filePath, time.Now(), f)
+
+	// Parse time range if provided
+	var startTime, endTime time.Time
+	var err error
+	if req.StartTime != "" {
+		startTime, err = time.Parse(time.RFC3339, req.StartTime)
+		if err != nil {
+			http.Error(w, "invalid start_time", http.StatusBadRequest)
+			return
+		}
+	}
+	if req.EndTime != "" {
+		endTime, err = time.Parse(time.RFC3339, req.EndTime)
+		if err != nil {
+			http.Error(w, "invalid end_time", http.StatusBadRequest)
+			return
+		}
+	}
+
+	// Use index to get relevant files
+	var files []string
+	indexMu.RLock()
+	if req.Service != "" {
+		files = append(files, partitionIndex[req.Service]...)
+	} else {
+		for _, fs := range partitionIndex {
+			files = append(files, fs...)
+		}
+	}
+	indexMu.RUnlock()
+
+	// Filter files by time range if provided
+	filteredFiles := files
+	if !startTime.IsZero() || !endTime.IsZero() {
+		filteredFiles = nil
+		for _, file := range files {
+			base := filepath.Base(file)
+			parts := strings.Split(base, "_")
+			if len(parts) < 3 {
+				continue
+			}
+			timePart := strings.TrimSuffix(parts[len(parts)-1], ".log")
+			fileTime, err := time.Parse("2006-01-02-15", timePart)
+			if err != nil {
+				continue
+			}
+			if (!startTime.IsZero() && fileTime.Before(startTime)) ||
+				(!endTime.IsZero() && fileTime.After(endTime)) {
+				continue
+			}
+			filteredFiles = append(filteredFiles, file)
+		}
+	}
+
+	resultCh := make(chan []LogEntry, len(filteredFiles))
+	var wg sync.WaitGroup
+
+	// Limit concurrency to avoid too many open files
+	maxConcurrency := 4
+	sem := make(chan struct{}, maxConcurrency)
+
+	for _, file := range filteredFiles {
+		wg.Add(1)
+		go func(file string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			var localResults []LogEntry
+			f, err := os.Open(file)
+			if err != nil {
+				return
+			}
+			scanner := bufio.NewScanner(f)
+			for scanner.Scan() {
+				var entry LogEntry
+				if err := json.Unmarshal(scanner.Bytes(), &entry); err != nil {
+					continue
+				}
+				if req.Level != "" && entry.Level != req.Level {
+					continue
+				}
+				if !startTime.IsZero() || !endTime.IsZero() {
+					entryTime, err := time.Parse(time.RFC3339, entry.Timestamp)
+					if err != nil {
+						continue
+					}
+					if !startTime.IsZero() && entryTime.Before(startTime) {
+						continue
+					}
+					if !endTime.IsZero() && entryTime.After(endTime) {
+						continue
+					}
+				}
+				localResults = append(localResults, entry)
+				// Early exit if limit reached
+				if req.Limit > 0 && len(localResults) >= req.Limit {
+					break
+				}
+			}
+			f.Close()
+			resultCh <- localResults
+		}(file)
+	}
+
+	go func() {
+		wg.Wait()
+		close(resultCh)
+	}()
+
+	var results []LogEntry
+collectLoop:
+	for res := range resultCh {
+		for _, entry := range res {
+			results = append(results, entry)
+			if req.Limit > 0 && len(results) >= req.Limit {
+				break collectLoop
+			}
+		}
+	}
+
+	json.NewEncoder(w).Encode(QueryResponse{Results: results})
+}
+
+type QueryRequest struct {
+	Service   string `json:"service,omitempty"`
+	Level     string `json:"level,omitempty"`
+	StartTime string `json:"start_time,omitempty"`
+	EndTime   string `json:"end_time,omitempty"`
+	Limit     int    `json:"limit,omitempty"`
+}
+type QueryResponse struct {
+	Results []LogEntry `json:"results"`
 }
 
 func compressOldFiles(olderThanDays int) {
@@ -290,9 +372,9 @@ func unregisterWithClusterManager(addr string) {
 
 func main() {
 	os.MkdirAll(dataDir, 0755)
+	buildPartitionIndex()
 	go compressOldFiles(3)
-	//go metricsLogger()
-	http.HandleFunc("/ingest", logHandler)
+	go metricsLogger()
 	http.HandleFunc("/ingest/batch", batchLogHandler)
 	http.HandleFunc("/query", queryHandler)
 	http.HandleFunc("/cluster/health", healthHandler)

@@ -294,4 +294,14 @@ Compressed log files are written to:
 - ❤️ **Automated Health Checks:** The cluster manager continuously performs health checks on all registered nodes. If a node (including the leader) becomes unhealthy or unreachable, it is automatically removed from the active peer list, and a new leader is elected if necessary.
 - ⚖️ **Dynamic Rebalancing:** When storage nodes join or leave, the consistent hashing ring automatically rebalances log distribution with minimal disruption.
 - 🔄 **Seamless Client Reconnection:** Both clients and ingestors automatically detect leader changes and update their connections. Clients reconnect to the new leader within 1 seconds after a failover, ensuring uninterrupted log ingestion and replication. The system quickly recovers from node failures with zero manual intervention.
-- 🛡️ **High Availability:** The combination of Raft leader election, rapid failover, and health checks ensures the cluster remains highly available and self-healing, even during rolling updates or
+- 🛡️ **High Availability:** The combination of Raft leader election, rapid failover, and health checks ensures the cluster remains highly available and self-healing, even during rolling updates.
+
+### 🚀 Day 19 Milestones
+
+- 🔍 **Distributed Query Service:** Introduced a dedicated query microservice that enables users and tools to efficiently query logs across all storage nodes and partitions.
+- ⚡ **Parallel, Partition-Aware Search:** The query service discovers healthy storage nodes from the cluster manager and fans out queries in parallel, aggregating results from all relevant partitions for fast, scalable log retrieval.
+- 🧠 **Service & Time-Range Optimization:** Queries are optimized to scan only the relevant files based on service name and time range, dramatically reducing search latency and resource usage.
+- 🧵 **Concurrent File Scanning:** Each storage node processes file scans concurrently, leveraging Go's goroutines for high-throughput, low-latency distributed search.
+- 🛠️ **Simple REST API:** Exposes a RESTful `/query` endpoint for flexible log search by service, level, and time window, supporting pagination and result limits.
+- 🔄 **Dynamic Node Awareness:** The query service automatically tracks changes in the storage cluster, ensuring queries always reach all healthy nodes—even as nodes join or leave.
+- 📈 **Cluster-Wide Visibility:** Enables real-time, cluster-wide log analytics and troubleshooting, making it easy to find and aggregate logs from any service or time period, regardless of where they are stored.

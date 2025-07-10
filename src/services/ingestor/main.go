@@ -399,14 +399,12 @@ func pickStorageNode(entry LogEntry) string {
 // ========== LOG ENTRY & VALIDATION ==========
 
 type LogEntry struct {
-	Timestamp   string `json:"timestamp"`
-	Level       string `json:"level"`
-	Message     string `json:"message"`
-	Service     string `json:"service"`
-	Hostname    string `json:"hostname,omitempty"`
-	Environment string `json:"environment,omitempty"`
-	AppVersion  string `json:"app_version,omitempty"`
-	ReceivedAt  string `json:"received_at,omitempty"`
+	Timestamp  string `json:"timestamp"`
+	Level      string `json:"level"`
+	Message    string `json:"message"`
+	Service    string `json:"service"`
+	Hostname   string `json:"hostname,omitempty"`
+	AppVersion string `json:"app_version,omitempty"`
 }
 
 func (e *LogEntry) Validate() error {
@@ -743,9 +741,7 @@ func startUDPServerOnConn(conn *net.UDPConn) {
 				continue
 			}
 			entry.Hostname, _ = os.Hostname()
-			entry.Environment = os.Getenv("ENVIRONMENT")
 			entry.AppVersion = os.Getenv("APP_VERSION")
-			entry.ReceivedAt = time.Now().UTC().Format(time.RFC3339)
 			recordSample("json", entry)
 			enqueueLog(entry)
 			recordLatency(time.Since(start))
@@ -857,12 +853,7 @@ func handleUniversalConnection(conn net.Conn) {
 			buf = buf[5+msgLen:]
 			continue
 		}
-		entry.ReceivedAt = time.Now().UTC().Format(time.RFC3339)
 		entry.Hostname, _ = os.Hostname()
-		entry.Environment = os.Getenv("ENVIRONMENT")
-		if entry.Environment == "" {
-			entry.Environment = "unknown"
-		}
 		entry.AppVersion = os.Getenv("APP_VERSION")
 		if entry.AppVersion == "" {
 			entry.AppVersion = "unknown"
@@ -1072,7 +1063,7 @@ func main() {
 	go startHTTPServer()
 	go startClusterHTTPServerOnListener(healthListener)
 	fetchAndCacheSchemas()
-	go metricsLogger()
+	//go metricsLogger()
 	for i := 0; i < partitionCount; i++ {
 		partitionChans[i] = make(chan LogEntry, 200000)
 		partitionBatchChans[i] = make(chan []LogEntry)

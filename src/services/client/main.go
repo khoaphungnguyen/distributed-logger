@@ -217,11 +217,11 @@ func main() {
 
 	// Discover leader host and ports before connecting
 	leaderHost, tcpPort, udpPort, err := discoverLeaderWithPorts(clusterManagerURL)
-	log.Println("Leader discovery result:", leaderHost, tcpPort, udpPort)
+	//log.Println("Leader discovery result:", leaderHost, tcpPort, udpPort)
 	if leaderHost == "" || tcpPort == 0 || udpPort == 0 {
 		log.Fatalf("Could not discover leader host/ports: %v", err)
 	}
-	log.Printf("Connecting to ingestor at %s (TCP:%d, UDP:%d)", leaderHost, tcpPort, udpPort)
+	//log.Printf("Connecting to ingestor at %s (TCP:%d, UDP:%d)", leaderHost, tcpPort, udpPort)
 
 	rand.Seed(time.Now().UnixNano())
 
