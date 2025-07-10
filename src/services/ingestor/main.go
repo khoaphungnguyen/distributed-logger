@@ -56,6 +56,8 @@ var (
 	lastHeartbeat   = time.Now()
 	electionResetCh = make(chan struct{}, 1)
 	selfAddr        string // set at runtime
+
+	healthPort int
 )
 
 // --- Raft Heartbeat Handler ---
@@ -118,8 +120,9 @@ func updatePeers() {
 	}
 	defer resp.Body.Close()
 	var nodes []struct {
-		Address   string `json:"address"`
-		IsHealthy bool   `json:"is_healthy"`
+		Address    string `json:"address"`
+		HealthPort int    `json:"health_port"`
+		IsHealthy  bool   `json:"is_healthy"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&nodes); err != nil {
 		log.Printf("Failed to decode peers: %v", err)
@@ -128,10 +131,11 @@ func updatePeers() {
 	var addrs []string
 	for _, n := range nodes {
 		if n.IsHealthy && n.Address != selfAddr {
-			addrs = append(addrs, n.Address)
+			addrs = append(addrs, n.Address+fmt.Sprintf(":%d", n.HealthPort))
 		}
 	}
 	sort.Strings(addrs)
+	//log.Println("[RAFT] Discovered peers:", addrs)
 	peerAddrsMutex.Lock()
 	if !equalStringSlices(peerAddrs, addrs) {
 		log.Printf("[RAFT] Peer list updated: %v", addrs)
@@ -154,9 +158,9 @@ func equalStringSlices(a, b []string) bool {
 
 // --- Raft Election Loop ---
 func raftElectionLoop() {
-	timeoutBase := 1000
+	timeoutBase := 300
 	for {
-		timeout := time.Duration(timeoutBase+rand.Intn(1000)) * time.Millisecond
+		timeout := time.Duration(timeoutBase+rand.Intn(150)) * time.Millisecond
 		raftMutex.Lock()
 		state := raftState
 		raftMutex.Unlock()
@@ -292,7 +296,7 @@ func unregisterWithClusterManager(addr string) {
 
 func notifyClusterManagerOfLeadership() {
 	body, _ := json.Marshal(map[string]interface{}{
-		"address": selfAddr,
+		"address": selfAddr + fmt.Sprintf(":%d", healthPort),
 		"term":    raftTerm,
 	})
 	http.Post(clusterManagerAddr+"/nodes/raft-leader", "application/json", bytes.NewReader(body))
@@ -329,7 +333,7 @@ func periodicallyUpdateClusterState() {
 	for {
 		updateStorageNodes()
 		updatePeers()
-		time.Sleep(1 * time.Second)
+		time.Sleep(200 * time.Millisecond)
 	}
 }
 
@@ -649,8 +653,7 @@ func incrementFormatCount(format string) {
 func startHTTPServer() {
 	mux := http.NewServeMux()
 	mux.Handle("/", http.FileServer(http.Dir("./static")))
-	mux.HandleFunc("/raft/vote", voteHandler)
-	mux.HandleFunc("/raft/heartbeat", heartbeatHandler)
+
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
 		metricsMutex.Lock()
 		snap := lastMetrics
@@ -1055,7 +1058,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to listen for health endpoint: %v", err)
 	}
-	healthPort := healthListener.Addr().(*net.TCPAddr).Port
+	healthPort = healthListener.Addr().(*net.TCPAddr).Port
 
 	hostname, _ := os.Hostname()
 	selfAddr = fmt.Sprintf("http://%s", hostname)
@@ -1152,6 +1155,8 @@ func startClusterHTTPServerOnListener(listener net.Listener) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("ok"))
 	})
+	mux.HandleFunc("/raft/vote", voteHandler)
+	mux.HandleFunc("/raft/heartbeat", heartbeatHandler)
 	log.Printf("Cluster HTTP endpoints available at %s (listening on %s)", selfAddr, listener.Addr().String())
 	server := &http.Server{
 		Handler:      mux,

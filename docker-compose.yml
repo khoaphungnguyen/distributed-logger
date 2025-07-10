@@ -73,7 +73,7 @@ services:
     depends_on:
       - ingestor-1
       - ingestor-2
-      - ingestor-3
+      - ingestor-3 
 
   client-2:
     build:

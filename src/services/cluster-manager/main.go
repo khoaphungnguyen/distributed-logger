@@ -163,7 +163,7 @@ func leaderHostHandler(w http.ResponseWriter, r *http.Request) {
 // Health check nodes and clear leader if unhealthy
 func healthCheckNodes() {
 	for {
-		time.Sleep(1 * time.Second)
+		time.Sleep(200 * time.Millisecond)
 		nodesMutex.Lock()
 		for _, node := range nodes {
 			healthURL := node.Address
