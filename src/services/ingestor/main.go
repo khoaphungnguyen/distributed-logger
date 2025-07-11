@@ -516,32 +516,70 @@ func partitionBatchWorker(idx int) {
 			}
 			nodeBatches[addr] = append(nodeBatches[addr], entry)
 		}
-		for addr, batch := range nodeBatches {
-			if err := forwardBatchToStorage(addr, batch); err != nil {
-				log.Printf("Partition %d: Failed to forward batch to %s: %v", idx, addr, err)
-			}
+		// For each batch, send to all storage nodes and require quorum
+		storageNodesMutex.RLock()
+		addrs := append([]string{}, storageNodes...)
+		storageNodesMutex.RUnlock()
+		quorum := 2 // e.g., require 2 out of 3 nodes to ack
+
+		if err := forwardBatchToStorageWithQuorum(addrs, entries, quorum); err != nil {
+			log.Printf("Partition %d: Write quorum failed: %v", idx, err)
 		}
 	}
 }
 
-func forwardBatchToStorage(addr string, entries []LogEntry) error {
-	if addr == "" || len(entries) == 0 {
+// Add this function for write quorum logic
+func forwardBatchToStorageWithQuorum(addrs []string, entries []LogEntry, quorum int) error {
+	if len(addrs) == 0 || len(entries) == 0 {
+		return fmt.Errorf("no storage nodes or entries")
+	}
+	type result struct {
+		err error
+	}
+	resultCh := make(chan result, len(addrs))
+	var wg sync.WaitGroup
+
+	b, _ := json.Marshal(entries)
+	for _, addr := range addrs {
+		wg.Add(1)
+		go func(addr string) {
+			defer wg.Done()
+			url := addr + "/ingest/batch"
+			resp, err := httpClient.Post(url, "application/json", bytes.NewReader(b))
+			if err != nil {
+				resultCh <- result{err: err}
+				return
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				body, _ := ioutil.ReadAll(resp.Body)
+				resultCh <- result{err: fmt.Errorf("storage error: %s", string(body))}
+				return
+			}
+			resultCh <- result{err: nil}
+		}(addr)
+	}
+
+	acks := 0
+	failures := 0
+	for i := 0; i < len(addrs); i++ {
+		res := <-resultCh
+		if res.err == nil {
+			acks++
+			if acks >= quorum {
+				break
+			}
+		} else {
+			failures++
+		}
+	}
+	wg.Wait()
+	if acks >= quorum {
+		atomic.AddInt64(&processCount, int64(len(entries)))
+		atomic.AddInt64(&totalBytes, int64(len(b)))
 		return nil
 	}
-	url := addr + "/ingest/batch"
-	b, _ := json.Marshal(entries)
-	resp, err := httpClient.Post(url, "application/json", bytes.NewReader(b))
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		body, _ := ioutil.ReadAll(resp.Body)
-		return fmt.Errorf("storage error: %s", string(body))
-	}
-	atomic.AddInt64(&processCount, int64(len(entries)))
-	atomic.AddInt64(&totalBytes, int64(len(b)))
-	return nil
+	return fmt.Errorf("write quorum not met: got %d/%d acks", acks, quorum)
 }
 
 // ========== METRICS & DASHBOARD ==========
