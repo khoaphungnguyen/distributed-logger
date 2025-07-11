@@ -3,9 +3,12 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
+	"hash/crc32"
 	"log"
 	"net/http"
 	"os"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -32,10 +35,68 @@ type QueryResponse struct {
 	Results []LogEntry `json:"results"`
 }
 
+// --- Consistent Hash Ring ---
+type hashRing struct {
+	nodes    []string
+	replicas int
+	keys     []uint32
+	hashMap  map[uint32]string
+}
+
+func newHashRing(nodes []string, replicas int) *hashRing {
+	hr := &hashRing{
+		nodes:    nodes,
+		replicas: replicas,
+		hashMap:  make(map[uint32]string),
+	}
+	hr.generate()
+	return hr
+}
+
+func (hr *hashRing) generate() {
+	hr.keys = nil
+	hr.hashMap = make(map[uint32]string)
+	for _, node := range hr.nodes {
+		for i := 0; i < hr.replicas; i++ {
+			key := fmt.Sprintf("%s#%d", node, i)
+			hash := crc32.ChecksumIEEE([]byte(key))
+			hr.keys = append(hr.keys, hash)
+			hr.hashMap[hash] = node
+		}
+	}
+	sort.Slice(hr.keys, func(i, j int) bool { return hr.keys[i] < hr.keys[j] })
+}
+
+func (hr *hashRing) getNodes(key string, n int) []string {
+	if len(hr.keys) == 0 || n <= 0 {
+		return nil
+	}
+	hash := crc32.ChecksumIEEE([]byte(key))
+	idx := sort.Search(len(hr.keys), func(i int) bool { return hr.keys[i] >= hash })
+	result := make([]string, 0, n)
+	seen := make(map[string]bool)
+	for i := 0; len(result) < n && i < len(hr.keys); i++ {
+		node := hr.hashMap[hr.keys[(idx+i)%len(hr.keys)]]
+		if !seen[node] {
+			result = append(result, node)
+			seen[node] = true
+		}
+	}
+	return result
+}
+
+// --- End Consistent Hash Ring ---
+
 var (
 	storageNodes      []string
 	storageNodesMutex sync.RWMutex
 	clusterManagerURL = os.Getenv("CLUSTER_MANAGER_ADDR")
+)
+
+var (
+	storageRing  *hashRing
+	replicaCount int
+	readQuorum   int
 )
 
 func updateStorageNodes() {
@@ -61,9 +122,21 @@ func updateStorageNodes() {
 	}
 	storageNodesMutex.Lock()
 	storageNodes = addrs
+	storageRing = newHashRing(addrs, 100)
+	// Dynamically set replicaCount and readQuorum
+	n := len(addrs)
+	if n >= 3 {
+		replicaCount = n / 2
+		if replicaCount < 3 {
+			replicaCount = 3 // minimum for safety
+		}
+		readQuorum = (replicaCount + 1) / 2
+	} else {
+		replicaCount = n
+		readQuorum = 1
+	}
 	storageNodesMutex.Unlock()
 }
-
 func periodicallyUpdateStorageNodes() {
 	for {
 		updateStorageNodes()
@@ -71,6 +144,7 @@ func periodicallyUpdateStorageNodes() {
 	}
 }
 
+// --- Query Handler with Read Repair ---
 func queryHandler(w http.ResponseWriter, r *http.Request) {
 	var req QueryRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -80,13 +154,26 @@ func queryHandler(w http.ResponseWriter, r *http.Request) {
 
 	storageNodesMutex.RLock()
 	nodes := append([]string{}, storageNodes...)
+	ring := storageRing
 	storageNodesMutex.RUnlock()
 
-	var wg sync.WaitGroup
-	resultCh := make(chan []LogEntry, len(nodes))
-	var totalCollected int64
+	if ring == nil || len(nodes) == 0 {
+		http.Error(w, "no storage nodes available", http.StatusServiceUnavailable)
+		return
+	}
 
-	for _, node := range nodes {
+	key := req.Service
+	replicas := ring.getNodes(key, replicaCount)
+
+	type replicaResult struct {
+		addr    string
+		entries []LogEntry
+	}
+	resultCh := make(chan replicaResult, len(replicas))
+	var totalCollected int64
+	var wg sync.WaitGroup
+
+	for _, node := range replicas {
 		wg.Add(1)
 		go func(addr string) {
 			defer wg.Done()
@@ -102,14 +189,9 @@ func queryHandler(w http.ResponseWriter, r *http.Request) {
 				log.Printf("Decode from %s failed: %v", addr, err)
 				return
 			}
-			// Only send up to the remaining needed logs
-			remaining := int(req.Limit) - int(atomic.LoadInt64(&totalCollected))
-			if req.Limit > 0 && remaining > 0 && len(qr.Results) > remaining {
-				qr.Results = qr.Results[:remaining]
-			}
 			n := int64(len(qr.Results))
 			if n > 0 && (req.Limit == 0 || atomic.AddInt64(&totalCollected, n) <= int64(req.Limit)) {
-				resultCh <- qr.Results
+				resultCh <- replicaResult{addr: addr, entries: qr.Results}
 			}
 		}(node)
 	}
@@ -119,15 +201,52 @@ func queryHandler(w http.ResponseWriter, r *http.Request) {
 		close(resultCh)
 	}()
 
-	var allResults []LogEntry
+	acks := 0
+	resultMap := make(map[string]LogEntry) // key: composite, value: freshest
+	type replicaVersion struct {
+		addr  string
+		entry LogEntry
+	}
+	replicaResults := make(map[string][]replicaVersion) // key: composite, value: all versions
+
 collectLoop:
 	for res := range resultCh {
-		for _, entry := range res {
-			allResults = append(allResults, entry)
-			if req.Limit > 0 && len(allResults) >= req.Limit {
+		acks++
+		for _, entry := range res.entries {
+			key := entry.Message + "|" + entry.Service + "|" + entry.Level
+			replicaResults[key] = append(replicaResults[key], replicaVersion{addr: res.addr, entry: entry})
+			existing, ok := resultMap[key]
+			if !ok || entry.Timestamp > existing.Timestamp {
+				resultMap[key] = entry
+			}
+			if req.Limit > 0 && len(resultMap) >= req.Limit {
 				break collectLoop
 			}
 		}
+		if acks >= readQuorum {
+			break
+		}
+	}
+
+	// Read Repair: For each key, if any replica returned a stale version, send the freshest to that replica
+	for key, freshest := range resultMap {
+		for _, rv := range replicaResults[key] {
+			if rv.entry.Timestamp < freshest.Timestamp {
+				go func(addr string, entry LogEntry) {
+					repairBody, _ := json.Marshal(entry)
+					_, err := http.Post(addr+"/repair", "application/json", bytes.NewReader(repairBody))
+					if err != nil {
+						log.Printf("Read repair to %s failed: %v", addr, err)
+					}
+				}(rv.addr, freshest)
+			}
+		}
+	}
+
+	// Convert map to slice for response
+	allResults := make([]LogEntry, 0, len(resultMap))
+	for _, entry := range resultMap {
+		allResults = append(allResults, entry)
 	}
 
 	json.NewEncoder(w).Encode(QueryResponse{Results: allResults})

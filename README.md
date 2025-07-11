@@ -2,9 +2,14 @@
 
 ## Project Overview
 
-## Project Overview
-
 Distributed Logger is a scalable, high-performance log processing platform for cloud environments. It ingests logs in multiple formats (JSON, Protobuf, Avro, and raw) over secure TCP and UDP, with dynamic schema validation and enrichment. The clustered architecture provides automatic leader election, peer discovery, and efficient log replication for high availability. A dedicated cluster manager handles node registration, health checks, and leader tracking, while clients automatically follow the current leader for seamless failover. Live dashboards and metrics offer real-time operational insight, and the platform is fully containerized for an easy deployment.
+
+**New:**
+
+- **Quorum-based replication and read repair** for strong consistency and self-healing.
+- **Write and read quorums** for ingestor and query services.
+- **Background anti-entropy engine** for storage nodes.
+
 This repository contains all the code and configuration needed to run the system.
 
 ## Getting Started
@@ -71,15 +76,15 @@ This repository contains all the code and configuration needed to run the system
 
 You can pass flags to the Go client container to configure its behavior:
 
-| Flag         | Description                                   | Default       |
-| ------------ | --------------------------------------------- | ------------- |
-| `--batch`    | Number of logs to send per batch              | `100`         |
-| `--interval` | Interval in milliseconds between batches      | `1000`        |
-| `--address`  | Ingestor host address                         | `go-ingestor` |
-| `--tcp-port` | TCP port for ingestion                        | `3001`        |
-| `--udp-port` | UDP port for ingestion                        | `3002`        |
-| `--udp`      | Use UDP instead of TCP                        | `false`       |
-| `--format`   | Log format: `json`, `proto`, `avro`, or `raw` | `json`        |
+| Flag         | Description                                   | Default    |
+| ------------ | --------------------------------------------- | ---------- |
+| `--batch`    | Number of logs to send per batch              | `100`      |
+| `--interval` | Interval in milliseconds between batches      | `1000`     |
+| `--address`  | Ingestor host address                         | `ingestor` |
+| `--tcp-port` | TCP port for ingestion                        | `3001`     |
+| `--udp-port` | UDP port for ingestion                        | `3002`     |
+| `--udp`      | Use UDP instead of TCP                        | `false`    |
+| `--format`   | Log format: `json`, `proto`, `avro`, or `raw` | `json`     |
 
 **Universal handler (default for TCP):**
 
@@ -91,6 +96,7 @@ Example:
 ```yaml
 client:
   command: --batch 500 --interval 10 --address go-ingestor --format avro
+  command: --batch 2000 --interval 10 --address go-ingestor --format proto
 ```
 
 ---
@@ -125,7 +131,9 @@ Compressed log files are written to:
 
 ## Development Milestones
 
-### 🚀 Day 1 Milestones
+---
+
+### 🚀 Day 1 Milestones: Project Initialization
 
 - Set up development environment
 - Created project structure
@@ -134,7 +142,9 @@ Compressed log files are written to:
 - 🌐 Added web interface to view logs and config
 - 🚧 Documented configuration and endpoints
 
-### 🚀 Day 2 Milestones
+---
+
+### 🚀 Day 2 Milestones: Enhanced Log Generator
 
 - ✅ Enhanced log generator with custom fields (e.g., user ID, session token)
 - 🔄 Supported multiple output formats: JSON, CSV, and plain text
@@ -142,7 +152,9 @@ Compressed log files are written to:
 - 🔁 Refined log patterns to reflect realistic event flows and timing
 - 📄 Updated documentation for log schema and usage examples
 
-### 🚀 Day 3 Milestones
+---
+
+### 🚀 Day 3 Milestones: Real-Time Log Collection
 
 - 👁️ Built a real-time log collector using file watchers
 - 🧠 Supported multiple log formats (JSON and plain text) with dynamic parsing
@@ -152,7 +164,9 @@ Compressed log files are written to:
 - 💾 Persisted structured collected entries to `collected_logs/collected.jsonl`
 - 🚧 Updated Docker Compose to pass collector configuration via CLI arguments
 
-### 🚀 Day 4 Milestones
+---
+
+### 🚀 Day 4 Milestones: Structured Output & Metrics
 
 - 🧹 Added support for SQLite and CSV as structured output formats alongside JSON
 - 📊 Implemented real-time statistics tracking for log levels, tags, and total entries
@@ -161,7 +175,9 @@ Compressed log files are written to:
 - 🧵 Used background threading to serve metrics without blocking the collector
 - 🚧️ Updated Docker Compose to support `--output-type`, `--filter`, and exposed web port
 
-### 🚀 Day 5 Milestones
+---
+
+### 🚀 Day 5 Milestones: Centralized Storage & Performance
 
 - 🔧 Introduced centralized log storage service (`log-storage`)
 - 🔁 Switched to Gunicorn for production-ready performance
@@ -169,7 +185,9 @@ Compressed log files are written to:
 - 📊 Improved web dashboard visuals and removed unnecessary charts
 - ⚡ Added real-time ingestion rate per second and source tracking
 
-### 🚀 Day 6 Milestones
+---
+
+### 🚀 Day 6 Milestones: Go Ingestor & High-Performance Client
 
 - 🚀 Transitioned to **Golang-based TCP log ingestion** (`go-ingestor`), replacing the original Flask-based ingestor, which could only handle around 150 messages per connection before significant slowdowns.
 - 🧱 Built high-performance `go-client` log generator with batching support
@@ -180,7 +198,9 @@ Compressed log files are written to:
 - 🧵 Used Goroutines for connection scaling, non-blocking write pipeline
 - 🐋 Updated Docker Compose to support multi-client scale testing
 
-### 🚀 Day 7 Milestones
+---
+
+### 🚀 Day 7 Milestones: UDP Ingestion & Monitoring
 
 - 📡 **Added UDP ingestion support** alongside existing TCP server in `go-ingestor`
 - 🔀 **Dual protocol support** (TCP/UDP) running on ports `3000` and `3001`
@@ -195,7 +215,9 @@ Compressed log files are written to:
 - 💾 Observed Gzip compression saving **\~95%+ storage** on log files
 - 🔍 Simulated realistic log generation: 5% ERROR, 10% WARN, 85% INFO/DEBUG
 
-### 🚀 Day 8 Milestones
+---
+
+### 🚀 Day 8 Milestones: Graceful Shutdown & Configurability
 
 - 🛡️ **Graceful shutdown**: Client now handles SIGINT/SIGTERM for safe exit and resource cleanup
 - ⚙️ **Configurable address and port**: Easily set ingestor host and port via CLI flags (`--address`, `--tcp-port`, `--udp-port`)
@@ -204,14 +226,18 @@ Compressed log files are written to:
 - 🧹 **Improved error handling**: Handles JSON marshal errors and connection issues robustly
 - 🔄 **Retry mechanism**: Retries failed batch transmissions up to 3 times for reliability
 
-### Day 9 Milestones
+---
+
+### 🚀 Day 9 Milestones: TLS & UDP Improvements
 
 - 🔒 **TLS encryption for TCP**: All TCP log traffic is now encrypted using TLS certificates
 - 📦 **UDP batch splitting**: Client splits UDP batches to avoid exceeding 1400 bytes (safe MTU)
 - 🛡️ **Production-ready ingestion**: Secure, reliable log delivery over TCP; UDP supported for high-throughput, lossy scenarios
 - 🧪 **Validated secure ingestion**: Confirmed end-to-end encrypted log flow and UDP chunking in multi-client tests
 
-### 🚀 Day 10 Milestones
+---
+
+### 🚀 Day 10 Milestones: Ultra-High Throughput & Optimizations
 
 - 🚀 **Ultra-high throughput:** The Go ingestor now reliably handles **1 million log messages per second** on a single instance with minimal drops.
 - 🏎️ **Optimized concurrency:** Switched all metrics and counters to atomic operations, eliminating global mutex contention for maximum parallelism.
@@ -223,7 +249,9 @@ Compressed log files are written to:
 - 🧵 **Scalable architecture:** Each writer operates independently, matching the number of CPU cores for optimal resource usage.
 - 🛡️ **All previous features retained:** Secure TLS TCP, UDP support, log rotation, compression, graceful shutdown, and robust error handling.
 
-### 🚀 Day 11 Milestones
+---
+
+### 🚀 Day 11 Milestones: Protobuf Support & Unified Metrics
 
 - 🚀 **Full Protobuf support:** Ingestor and client now support high-throughput, length-prefixed Protobuf log streaming with batching.
 - 🏷️ **Schema validation for Protobuf:** Protobuf log entries are validated with the same strict schema checks as JSON logs.
@@ -232,7 +260,9 @@ Compressed log files are written to:
 - 🏭 **Production-grade ingestion:** System validated at >1M logs/sec with multiple clients, minimal drops, and robust error handling for both formats.
 - ⚡ **Latency breakthrough:** Protobuf ingestion latency reduced from 1–2 µs (microseconds) to as low as **0.2 µs** per log entry, surpassing previous JSON performance.
 
-### 🚀 Day 12 Milestones
+---
+
+### 🚀 Day 12 Milestones: Avro & Universal Handler
 
 - 📦 **Avro serialization support:** Both client and ingestor now support Avro log serialization and ingestion.
 - 🔄 **Universal handler:** All formats (Raw, JSON, Avro, Protobuf) are now handled on a single secure TCP port (`3001`) using a format header.
@@ -240,7 +270,9 @@ Compressed log files are written to:
 - 🛠️ **Unified ingestion pipeline:** No more separate ports for different formats—universal handler simplifies deployment and scaling.
 - 🌐 **Validated at scale:** Multiple clients sending mixed formats concurrently, all ingested and normalized with accurate metrics and robust performance.
 
-### 🚀 Day 13 Milestones
+---
+
+### 🚀 Day 13 Milestones: Schema Registry Integration
 
 - 🗄️ **Schema Registry Service:** Added a dedicated schema registry microservice.
 - 📥 **Dynamic schema registration:** Clients and servers can register, fetch, and list schemas for all supported formats (JSON, Avro, Protobuf) via HTTP API.
@@ -248,7 +280,9 @@ Compressed log files are written to:
 - 🛡️ **End-to-end schema validation:** Both client and server validate logs against the latest schema from the registry, ensuring data integrity and compatibility.
 - 🧩 **Extensible architecture:** System now supports registering and using multiple log types and schema versions, paving the way for future extensibility.
 
-## 🚀 Day 14 Milestones
+---
+
+### 🚀 Day 14 Milestones: Format Detection & Syslog/Journald
 
 - 🕵️ **Format detection engine:** Refined and hardened the automatic detection of incoming log formats in the ingestion pipeline. Now robustly distinguishes between syslog, journald, and custom raw log lines, eliminating accidental misclassification (e.g., JSON detected as raw).
 - 🔌 **Syslog & journald adapters:** Improved adapters to parse real-world syslog and journald log lines using regex and field extraction, mapping all standard syslog/journald levels and timestamps to the normalized `LogEntry` struct.
@@ -257,7 +291,9 @@ Compressed log files are written to:
 - 📤 **Flexible output options:** Continued support for exporting logs in structured text and CSV formats, in addition to JSONL and compressed outputs.
 - 📊 **Dashboard enhancements:** Updated the web dashboard and `/metrics` endpoint to display live statistics and sample entries per log format, providing deeper operational insights and real-time visibility into ingested data.
 
-### 🚀 Day 15 Milestones
+---
+
+### 🚀 Day 15 Milestones: Log Enrichment Pipeline
 
 - ✨ **Log enrichment pipeline:** Added an enrichment step to the ingestion pipeline, automatically attaching contextual metadata (such as `hostname`, `environment`, `app_version`, `received_at`, and container/pod info) to every log entry.
 - 🏷️ **Configurable enrichment fields:** Enrichment fields are sourced from environment variables and system calls, with sensible defaults for missing values.
@@ -265,7 +301,9 @@ Compressed log files are written to:
 - 🧩 **Future-proof design:** The enrichment logic is modular and ready to be moved to a dedicated microservice as the system scales, enabling independent scaling and advanced enrichment strategies.
 - 📊 **Dashboard and metrics update:** The web dashboard and `/metrics` endpoint now display sample logs with all enrichment fields, providing full visibility into the enriched log schema.
 
-### 🚀 Day 16 Milestones
+---
+
+### 🚀 Day 16 Milestones: Cluster Manager & Leader Election
 
 - 🗂️ **Cluster Manager Service:** Introduced a dedicated cluster manager microservice responsible for node registration, health checks, leader election, and peer discovery. All ingestors now register and synchronize their state via the cluster manager.
 - 👑 **Replicated Leader Architecture:** The ingestor service now supports leader election and log replication. Only the elected leader ingests logs from clients; followers receive replicated logs from the leader for high availability and durability.
@@ -275,7 +313,9 @@ Compressed log files are written to:
 - 🖥️ **Cluster Dashboard:** The cluster manager exposes a simple web dashboard displaying the current leader and all healthy peers, auto-refreshing every second for real-time cluster visibility and failover simulation.
 - 🛡️ **Robustness Improvements:** Enhanced shutdown handling, error recovery, and resource cleanup across all services to ensure stability during failover and rolling updates.
 
-### 🚀 Day 17 Milestones
+---
+
+### 🚀 Day 17 Milestones: Ingestor/Storage Separation & Partitioned Batching
 
 - 🏗️ **Ingestor/Storage Separation:** The ingestion and storage responsibilities are now handled by dedicated microservices. The ingestor focuses on high-throughput log validation, enrichment, batching, and forwarding, while the storage service is optimized for efficient, concurrent disk writes.
 - 🧩 **Partitioned Batching Pipeline:** The ingestor now partitions incoming logs across multiple independent batching pipelines based on log attributes (e.g., service name). Each partition batches logs and forwards them to storage in parallel, maximizing CPU and network utilization.
@@ -287,7 +327,9 @@ Compressed log files are written to:
 - 🧪 **Stress-Tested at Scale:** The new architecture has been validated at 1M+ logs/sec with multiple clients and storage nodes, demonstrating robust performance and balanced resource usage.
 - 📊 **Dashboard Enhancements:** The dashboard and `/metrics` endpoint now report partition-level stats, storage node health, and end-to-end delivery rates for full operational visibility.
 
-### 🚀 Day 18 Milestones
+---
+
+### 🚀 Day 18 Milestones: Consistent Hashing, Raft, and Dynamic Rebalancing
 
 - 🔗 **Consistent Hashing for Log Distribution:** Implemented consistent hashing in the ingestor pipeline to ensure logs are evenly and predictably distributed across storage nodes, even as nodes are added or removed. This minimizes data movement and prevents hotspots, enabling seamless horizontal scaling.
 - 👑 **Raft-Based Leader Election & Fast Failover:** Integrated Raft for robust, decentralized leader election among ingestor nodes. When the leader fails, a new leader is automatically re-elected within 1 seconds, ensuring minimal disruption. Only the elected leader coordinates cluster-wide tasks, while followers synchronize state and are ready to take over instantly.
@@ -296,7 +338,9 @@ Compressed log files are written to:
 - 🔄 **Seamless Client Reconnection:** Both clients and ingestors automatically detect leader changes and update their connections. Clients reconnect to the new leader within 1 seconds after a failover, ensuring uninterrupted log ingestion and replication. The system quickly recovers from node failures with zero manual intervention.
 - 🛡️ **High Availability:** The combination of Raft leader election, rapid failover, and health checks ensures the cluster remains highly available and self-healing, even during rolling updates.
 
-### 🚀 Day 19 Milestones
+---
+
+### 🚀 Day 19 Milestones: Distributed Query Service
 
 - 🔍 **Distributed Query Service:** Introduced a dedicated query microservice that enables users and tools to efficiently query logs across all storage nodes and partitions.
 - ⚡ **Parallel, Partition-Aware Search:** The query service discovers healthy storage nodes from the cluster manager and fans out queries in parallel, aggregating results from all relevant partitions for fast, scalable log retrieval.
@@ -305,3 +349,15 @@ Compressed log files are written to:
 - 🛠️ **Simple REST API:** Exposes a RESTful `/query` endpoint for flexible log search by service, level, and time window, supporting pagination and result limits.
 - 🔄 **Dynamic Node Awareness:** The query service automatically tracks changes in the storage cluster, ensuring queries always reach all healthy nodes—even as nodes join or leave.
 - 📈 **Cluster-Wide Visibility:** Enables real-time, cluster-wide log analytics and troubleshooting, making it easy to find and aggregate logs from any service or time period, regardless of where they are stored.
+
+---
+
+### 🚀 Day 20 Milestones: Quorum Replication & Read Repair Engine
+
+- 🗂️ **Quorum-Based Replication:** The ingestor now uses a configurable write quorum for log replication to storage nodes, ensuring durability and consistency even in the presence of node failures.
+- 🛡️ **Write Quorum for Ingestor:** Logs are only considered successfully stored when a quorum of storage nodes acknowledges the batch, providing strong guarantees against data loss.
+- 🔍 **Read Quorum for Query:** The query service now performs quorum reads, collecting results from a configurable number of replicas and merging them to ensure the freshest data is returned.
+- 🔄 **Read Repair Engine:** During query operations, if stale data is detected on any replica, the freshest version is immediately sent back to the stale node for repair, ensuring the cluster self-heals over time.
+- 🔧 **Background Anti-Entropy (Storage):** Each storage node runs a background repair engine that periodically checks its data against peers, repairing itself or others if staleness is detected, inspired by Dynamo/Cassandra anti-entropy.
+- ⚖️ **Dynamic Quorum Configuration:** Both write and read quorums are dynamically calculated based on the number of healthy storage nodes, with sensible minimums for safety and performance.
+- 📈 **Consistency & Availability:** These features together provide strong consistency, high availability, and robust self-healing, making the system production-ready for demanding distributed log workloads.

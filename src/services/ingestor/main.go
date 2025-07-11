@@ -370,30 +370,37 @@ func (hr *hashRing) generate() {
 	sort.Slice(hr.keys, func(i, j int) bool { return hr.keys[i] < hr.keys[j] })
 }
 
-func (hr *hashRing) getNode(key string) string {
-	if len(hr.keys) == 0 {
-		return ""
+// Helper: Get N unique nodes from the hash ring, starting from the hash of the key
+func (hr *hashRing) getNodes(key string, n int) []string {
+	if len(hr.keys) == 0 || n <= 0 {
+		return nil
 	}
 	hash := crc32Hash(key)
 	idx := sort.Search(len(hr.keys), func(i int) bool { return hr.keys[i] >= hash })
-	if idx == len(hr.keys) {
-		idx = 0
+	result := make([]string, 0, n)
+	seen := make(map[string]bool)
+	for i := 0; len(result) < n && i < len(hr.keys); i++ {
+		node := hr.hashMap[hr.keys[(idx+i)%len(hr.keys)]]
+		if !seen[node] {
+			result = append(result, node)
+			seen[node] = true
+		}
 	}
-	return hr.hashMap[hr.keys[idx]]
+	return result
 }
 
 func crc32Hash(s string) uint32 {
 	return crc32.ChecksumIEEE([]byte(s))
 }
 
-func pickStorageNode(entry LogEntry) string {
+func pickStorageNodes(entry LogEntry, n int) []string {
 	storageNodesMutex.RLock()
 	defer storageNodesMutex.RUnlock()
 	if storageRing == nil || len(storageNodes) == 0 {
-		return ""
+		return nil
 	}
 	key := entry.Service
-	return storageRing.getNode(key)
+	return storageRing.getNodes(key, n)
 }
 
 // ========== LOG ENTRY & VALIDATION ==========
@@ -506,80 +513,66 @@ func partitionBatchDispatcher(idx int) {
 }
 
 func partitionBatchWorker(idx int) {
+	replicaCount := len(storageNodes)
+	quorum := (replicaCount + 1) / 2
+
 	for entries := range partitionBatchChans[idx] {
 		nodeBatches := make(map[string][]LogEntry)
 		for _, entry := range entries {
-			addr := pickStorageNode(entry)
-			if addr == "" {
-				log.Printf("Partition %d: No available storage node for entry: %+v", idx, entry)
-				continue
+			replicas := pickStorageNodes(entry, replicaCount)
+			for _, addr := range replicas {
+				nodeBatches[addr] = append(nodeBatches[addr], entry)
 			}
-			nodeBatches[addr] = append(nodeBatches[addr], entry)
 		}
-		// For each batch, send to all storage nodes and require quorum
-		storageNodesMutex.RLock()
-		addrs := append([]string{}, storageNodes...)
-		storageNodesMutex.RUnlock()
-		quorum := 2 // e.g., require 2 out of 3 nodes to ack
 
-		if err := forwardBatchToStorageWithQuorum(addrs, entries, quorum); err != nil {
-			log.Printf("Partition %d: Write quorum failed: %v", idx, err)
+		type result struct {
+			err  error
+			size int
 		}
-	}
-}
+		resultCh := make(chan result, len(nodeBatches))
+		var wg sync.WaitGroup
 
-// Add this function for write quorum logic
-func forwardBatchToStorageWithQuorum(addrs []string, entries []LogEntry, quorum int) error {
-	if len(addrs) == 0 || len(entries) == 0 {
-		return fmt.Errorf("no storage nodes or entries")
-	}
-	type result struct {
-		err error
-	}
-	resultCh := make(chan result, len(addrs))
-	var wg sync.WaitGroup
+		for addr, logs := range nodeBatches {
+			wg.Add(1)
+			go func(addr string, logs []LogEntry) {
+				defer wg.Done()
+				b, _ := json.Marshal(logs)
+				url := addr + "/ingest/batch"
+				resp, err := httpClient.Post(url, "application/json", bytes.NewReader(b))
+				if err != nil {
+					resultCh <- result{err: err, size: 0}
+					return
+				}
+				defer resp.Body.Close()
+				if resp.StatusCode != http.StatusOK {
+					body, _ := ioutil.ReadAll(resp.Body)
+					resultCh <- result{err: fmt.Errorf("storage error: %s", string(body)), size: 0}
+					return
+				}
+				resultCh <- result{err: nil, size: len(b)}
+			}(addr, logs)
+		}
 
-	b, _ := json.Marshal(entries)
-	for _, addr := range addrs {
-		wg.Add(1)
-		go func(addr string) {
-			defer wg.Done()
-			url := addr + "/ingest/batch"
-			resp, err := httpClient.Post(url, "application/json", bytes.NewReader(b))
-			if err != nil {
-				resultCh <- result{err: err}
-				return
+		acks := 0
+		sentBytes := 0
+		for i := 0; i < len(nodeBatches); i++ {
+			res := <-resultCh
+			if res.err == nil {
+				acks++
+				sentBytes += res.size
+				if acks >= quorum {
+					break
+				}
 			}
-			defer resp.Body.Close()
-			if resp.StatusCode != http.StatusOK {
-				body, _ := ioutil.ReadAll(resp.Body)
-				resultCh <- result{err: fmt.Errorf("storage error: %s", string(body))}
-				return
-			}
-			resultCh <- result{err: nil}
-		}(addr)
-	}
-
-	acks := 0
-	failures := 0
-	for i := 0; i < len(addrs); i++ {
-		res := <-resultCh
-		if res.err == nil {
-			acks++
-			if acks >= quorum {
-				break
-			}
+		}
+		wg.Wait()
+		if acks >= quorum {
+			atomic.AddInt64(&processCount, int64(len(entries)))
+			atomic.AddInt64(&totalBytes, int64(sentBytes))
 		} else {
-			failures++
+			log.Printf("Partition %d: Write quorum failed: got %d/%d acks", idx, acks, quorum)
 		}
 	}
-	wg.Wait()
-	if acks >= quorum {
-		atomic.AddInt64(&processCount, int64(len(entries)))
-		atomic.AddInt64(&totalBytes, int64(len(b)))
-		return nil
-	}
-	return fmt.Errorf("write quorum not met: got %d/%d acks", acks, quorum)
 }
 
 // ========== METRICS & DASHBOARD ==========

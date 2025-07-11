@@ -6,6 +6,7 @@ import (
 	"compress/gzip"
 	"encoding/json"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"log"
 	"net"
@@ -14,12 +15,209 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
 )
+
+// --- Consistent Hash Ring (copy from ingestor/query or share as a package) ---
+type hashRing struct {
+	nodes    []string
+	replicas int
+	keys     []uint32
+	hashMap  map[uint32]string
+}
+
+func newHashRing(nodes []string, replicas int) *hashRing {
+	hr := &hashRing{
+		nodes:    nodes,
+		replicas: replicas,
+		hashMap:  make(map[uint32]string),
+	}
+	hr.generate()
+	return hr
+}
+
+func (hr *hashRing) generate() {
+	hr.keys = nil
+	hr.hashMap = make(map[uint32]string)
+	for _, node := range hr.nodes {
+		for i := 0; i < hr.replicas; i++ {
+			key := fmt.Sprintf("%s#%d", node, i)
+			hash := crc32.ChecksumIEEE([]byte(key))
+			hr.keys = append(hr.keys, hash)
+			hr.hashMap[hash] = node
+		}
+	}
+	sort.Slice(hr.keys, func(i, j int) bool { return hr.keys[i] < hr.keys[j] })
+}
+
+func (hr *hashRing) getNodes(key string, n int) []string {
+	if len(hr.keys) == 0 || n <= 0 {
+		return nil
+	}
+	hash := crc32.ChecksumIEEE([]byte(key))
+	idx := sort.Search(len(hr.keys), func(i int) bool { return hr.keys[i] >= hash })
+	result := make([]string, 0, n)
+	seen := make(map[string]bool)
+	for i := 0; len(result) < n && i < len(hr.keys); i++ {
+		node := hr.hashMap[hr.keys[(idx+i)%len(hr.keys)]]
+		if !seen[node] {
+			result = append(result, node)
+			seen[node] = true
+		}
+	}
+	return result
+}
+
+// Add global variables for ring and storage nodes
+var (
+	storageNodes      []string
+	storageNodesMutex sync.RWMutex
+	storageRing       *hashRing
+	replicaCount      = 3 // Should match ingestor/query
+)
+
+// Update storageNodes and ring periodically (call this in main)
+func updateStorageNodes() {
+	resp, err := http.Get(clusterManagerAddr + "/storage-nodes")
+	if err != nil {
+		log.Printf("Failed to get storage nodes: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+	var nodes []struct {
+		Address   string `json:"address"`
+		IsHealthy bool   `json:"is_healthy"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&nodes); err != nil {
+		log.Printf("Failed to decode storage nodes: %v", err)
+		return
+	}
+	var addrs []string
+	for _, n := range nodes {
+		if n.IsHealthy {
+			addrs = append(addrs, n.Address)
+		}
+	}
+	storageNodesMutex.Lock()
+	storageNodes = addrs
+	storageRing = newHashRing(addrs, 100)
+	storageNodesMutex.Unlock()
+}
+
+func periodicallyUpdateStorageNodes() {
+	for {
+		updateStorageNodes()
+		time.Sleep(2 * time.Second)
+	}
+}
+
+// --- /get_entry endpoint for peer repair ---
+func getEntryHandler(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Service string `json:"service"`
+		Level   string `json:"level"`
+		Message string `json:"message"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	indexMu.RLock()
+	files := partitionIndex[req.Service]
+	indexMu.RUnlock()
+	for _, file := range files {
+		f, err := os.Open(file)
+		if err != nil {
+			continue
+		}
+		scanner := bufio.NewScanner(f)
+		for scanner.Scan() {
+			var entry LogEntry
+			if err := json.Unmarshal(scanner.Bytes(), &entry); err != nil {
+				continue
+			}
+			if entry.Service == req.Service && entry.Level == req.Level && entry.Message == req.Message {
+				json.NewEncoder(w).Encode(entry)
+				f.Close()
+				return
+			}
+		}
+		f.Close()
+	}
+	http.Error(w, "not found", http.StatusNotFound)
+}
+
+// --- Read Repair Engine (background anti-entropy) ---
+func readRepairEngine() {
+	ticker := time.NewTicker(10 * time.Minute)
+	for range ticker.C {
+		storageNodesMutex.RLock()
+		ring := storageRing
+		nodes := append([]string{}, storageNodes...)
+		storageNodesMutex.RUnlock()
+		if ring == nil || len(nodes) == 0 {
+			continue
+		}
+		indexMu.RLock()
+		for _, files := range partitionIndex {
+			for _, file := range files {
+				f, err := os.Open(file)
+				if err != nil {
+					continue
+				}
+				scanner := bufio.NewScanner(f)
+				for scanner.Scan() {
+					var entry LogEntry
+					if err := json.Unmarshal(scanner.Bytes(), &entry); err != nil {
+						continue
+					}
+					// Compute responsible replicas for this entry
+					replicas := ring.getNodes(entry.Service, replicaCount)
+					for _, peer := range replicas {
+						if peer == selfAddr {
+							continue // skip self
+						}
+						go func(peer string, entry LogEntry) {
+							reqBody, _ := json.Marshal(map[string]string{
+								"service": entry.Service,
+								"level":   entry.Level,
+								"message": entry.Message,
+							})
+							resp, err := http.Post(peer+"/get_entry", "application/json", bytes.NewReader(reqBody))
+							if err != nil {
+								return
+							}
+							defer resp.Body.Close()
+							if resp.StatusCode != http.StatusOK {
+								return
+							}
+							var peerEntry LogEntry
+							if err := json.NewDecoder(resp.Body).Decode(&peerEntry); err != nil {
+								return
+							}
+							// If peer has newer, repair self
+							if peerEntry.Timestamp > entry.Timestamp {
+								repairHandlerInternal(peerEntry)
+							}
+							// If self is newer, repair peer
+							if entry.Timestamp > peerEntry.Timestamp {
+								repairBody, _ := json.Marshal(entry)
+								http.Post(peer+"/repair", "application/json", bytes.NewReader(repairBody))
+							}
+						}(peer, entry)
+					}
+				}
+				f.Close()
+			}
+		}
+		indexMu.RUnlock()
+	}
+}
 
 type LogEntry struct {
 	Timestamp  string `json:"timestamp"`
@@ -370,14 +568,127 @@ func unregisterWithClusterManager(addr string) {
 	log.Printf("Unregistered from cluster manager")
 }
 
+// Internal repair logic (reuse your repairHandler logic)
+func repairHandlerInternal(entry LogEntry) {
+	partition := getPartitionKey(entry)
+	filePath := filepath.Join(dataDir, fmt.Sprintf("partition_%s.log", partition))
+	// ...same logic as in repairHandler to update file...
+	var updatedEntries []LogEntry
+	found := false
+	f, err := os.Open(filePath)
+	if err == nil {
+		scanner := bufio.NewScanner(f)
+		for scanner.Scan() {
+			var existing LogEntry
+			if err := json.Unmarshal(scanner.Bytes(), &existing); err != nil {
+				continue
+			}
+			if existing.Message == entry.Message && existing.Service == entry.Service && existing.Level == entry.Level {
+				if entry.Timestamp > existing.Timestamp {
+					updatedEntries = append(updatedEntries, entry)
+				} else {
+					updatedEntries = append(updatedEntries, existing)
+				}
+				found = true
+			} else {
+				updatedEntries = append(updatedEntries, existing)
+			}
+		}
+		f.Close()
+	}
+	if !found {
+		updatedEntries = append(updatedEntries, entry)
+	}
+	tmpFile := filePath + ".tmp"
+	out, err := os.OpenFile(tmpFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		return
+	}
+	enc := json.NewEncoder(out)
+	for _, e := range updatedEntries {
+		enc.Encode(e)
+	}
+	out.Close()
+	os.Rename(tmpFile, filePath)
+}
+
+// Add this handler function:
+func repairHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Only POST supported", http.StatusMethodNotAllowed)
+		return
+	}
+	var entry LogEntry
+	if err := json.NewDecoder(r.Body).Decode(&entry); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+
+	partition := getPartitionKey(entry)
+	filePath := filepath.Join(dataDir, fmt.Sprintf("partition_%s.log", partition))
+
+	// Read all entries, replace if same key and incoming is newer
+	var updatedEntries []LogEntry
+	found := false
+
+	// Try to open the file, but it's ok if it doesn't exist yet
+	f, err := os.Open(filePath)
+	if err == nil {
+		scanner := bufio.NewScanner(f)
+		for scanner.Scan() {
+			var existing LogEntry
+			if err := json.Unmarshal(scanner.Bytes(), &existing); err != nil {
+				continue
+			}
+			// Use composite key for uniqueness
+			if existing.Message == entry.Message && existing.Service == entry.Service && existing.Level == entry.Level {
+				// Compare timestamps
+				if entry.Timestamp > existing.Timestamp {
+					updatedEntries = append(updatedEntries, entry)
+				} else {
+					updatedEntries = append(updatedEntries, existing)
+				}
+				found = true
+			} else {
+				updatedEntries = append(updatedEntries, existing)
+			}
+		}
+		f.Close()
+	}
+	if !found {
+		updatedEntries = append(updatedEntries, entry)
+	}
+
+	// Rewrite the file with updated entries
+	tmpFile := filePath + ".tmp"
+	out, err := os.OpenFile(tmpFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	enc := json.NewEncoder(out)
+	for _, e := range updatedEntries {
+		enc.Encode(e)
+	}
+	out.Close()
+	os.Rename(tmpFile, filePath)
+
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("repaired"))
+}
+
 func main() {
 	os.MkdirAll(dataDir, 0755)
 	buildPartitionIndex()
 	go compressOldFiles(3)
-	go metricsLogger()
+	go periodicallyUpdateStorageNodes()
+	go readRepairEngine()
+	//go metricsLogger()
 	http.HandleFunc("/ingest/batch", batchLogHandler)
 	http.HandleFunc("/query", queryHandler)
 	http.HandleFunc("/cluster/health", healthHandler)
+	http.HandleFunc("/repair", repairHandler)
+	http.HandleFunc("/get_entry", getEntryHandler)
 
 	storageName := os.Getenv("STORAGE_NAME")
 	if storageName == "" {
