@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -14,7 +15,7 @@ import (
 
 type Node struct {
 	Address    string    `json:"address"`
-	Type       string    `json:"type"` // "ingestor" or "storage"
+	Type       string    `json:"type"` // "ingestor", "storage", "schema", "query", etc.
 	TCPPort    int       `json:"tcp_port,omitempty"`
 	UDPPort    int       `json:"udp_port,omitempty"`
 	HealthPort int       `json:"health_port,omitempty"`
@@ -29,7 +30,97 @@ var (
 	term       int    // Election term number (set by Raft)
 )
 
-// Register a node (requires address and type)
+// --- Resource Metrics Helper ---
+func getResourceMetrics() map[string]interface{} {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	return map[string]interface{}{
+		"cpu_count":  runtime.NumCPU(),
+		"goroutines": runtime.NumGoroutine(),
+		"mem_alloc":  m.Alloc,
+		"mem_sys":    m.Sys,
+		"mem_heap":   m.HeapAlloc,
+		"pid":        os.Getpid(),
+		"hostname":   func() string { h, _ := os.Hostname(); return h }(),
+	}
+}
+
+// --- Cluster Metrics Handler ---
+func metricsHandler(w http.ResponseWriter, r *http.Request) {
+	nodesMutex.Lock()
+	defer nodesMutex.Unlock()
+	counts := map[string]int{}
+	healthy := map[string]int{}
+	badNodes := []map[string]interface{}{}
+	for _, n := range nodes {
+		counts[n.Type]++
+		if n.IsHealthy {
+			healthy[n.Type]++
+		} else {
+			badNodes = append(badNodes, map[string]interface{}{
+				"address":   n.Address,
+				"type":      n.Type,
+				"last_seen": n.LastSeen,
+			})
+		}
+	}
+	metrics := map[string]interface{}{
+		"service_type":  "cluster-manager",
+		"service_id":    "cluster-manager",
+		"node_counts":   counts,
+		"healthy_nodes": healthy,
+		"bad_nodes":     badNodes,
+		"leader":        leader,
+		"term":          term,
+		"resource":      getResourceMetrics(),
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(metrics)
+}
+
+// --- Expose all nodes (with health info) ---
+func nodesHandler(w http.ResponseWriter, r *http.Request) {
+	nodesMutex.Lock()
+	defer nodesMutex.Unlock()
+	list := []*Node{}
+	for _, n := range nodes {
+		list = append(list, n)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(list)
+}
+
+// --- Expose only unhealthy nodes for quick detection ---
+func badNodesHandler(w http.ResponseWriter, r *http.Request) {
+	nodesMutex.Lock()
+	defer nodesMutex.Unlock()
+	bad := []*Node{}
+	for _, n := range nodes {
+		if !n.IsHealthy {
+			bad = append(bad, n)
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(bad)
+}
+
+// --- Expose healthy schema service address ---
+func schemaServiceHandler(w http.ResponseWriter, r *http.Request) {
+	nodesMutex.Lock()
+	defer nodesMutex.Unlock()
+	for _, n := range nodes {
+		if n.Type == "schema" && n.IsHealthy {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]string{
+				"address": n.Address,
+			})
+			return
+		}
+	}
+	http.Error(w, "no healthy schema service found", 404)
+}
+
+// --- Register a node (requires address and type) ---
 func registerHandler(w http.ResponseWriter, r *http.Request) {
 	var req Node
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Address == "" || req.Type == "" {
@@ -50,7 +141,7 @@ func registerHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-// Unregister a node
+// --- Unregister a node ---
 func unregisterHandler(w http.ResponseWriter, r *http.Request) {
 	var req Node
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Address == "" {
@@ -60,7 +151,6 @@ func unregisterHandler(w http.ResponseWriter, r *http.Request) {
 	nodesMutex.Lock()
 	defer nodesMutex.Unlock()
 	delete(nodes, req.Address)
-	// If the leader node is removed, clear leader info
 	if req.Address == leader {
 		leader = ""
 		term = 0
@@ -68,19 +158,7 @@ func unregisterHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-// Return all nodes
-func nodesHandler(w http.ResponseWriter, r *http.Request) {
-	nodesMutex.Lock()
-	defer nodesMutex.Unlock()
-	list := []*Node{}
-	for _, n := range nodes {
-		list = append(list, n)
-	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(list)
-}
-
-// Return only healthy storage nodes
+// --- Return only healthy storage nodes ---
 func storageNodesHandler(w http.ResponseWriter, r *http.Request) {
 	nodesMutex.Lock()
 	defer nodesMutex.Unlock()
@@ -94,7 +172,7 @@ func storageNodesHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(list)
 }
 
-// Return only healthy ingestor nodes
+// --- Return only healthy ingestor nodes ---
 func ingestorNodesHandler(w http.ResponseWriter, r *http.Request) {
 	nodesMutex.Lock()
 	defer nodesMutex.Unlock()
@@ -108,7 +186,6 @@ func ingestorNodesHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(list)
 }
 
-// Return the current leader (as set by Raft notification)
 func leaderHandler(w http.ResponseWriter, r *http.Request) {
 	nodesMutex.Lock()
 	defer nodesMutex.Unlock()
@@ -117,24 +194,32 @@ func leaderHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	n := nodes[leader]
+
+	// Extract host (without scheme)
+	host := n.Address
+	if strings.HasPrefix(host, "http") {
+		u, err := url.Parse(n.Address)
+		if err == nil {
+			host = u.Hostname()
+		}
+	}
+
 	resp := struct {
-		Leader     string `json:"leader"`
-		Term       int    `json:"term"`
-		TCPPort    int    `json:"tcp_port,omitempty"`
-		UDPPort    int    `json:"udp_port,omitempty"`
-		HealthPort int    `json:"health_port,omitempty"`
+		Leader  string `json:"leader"` // just the host
+		Term    int    `json:"term"`
+		TCPPort int    `json:"tcp_port,omitempty"`
+		UDPPort int    `json:"udp_port,omitempty"`
 	}{
-		Leader:     n.Address,
-		Term:       term,
-		TCPPort:    n.TCPPort,
-		UDPPort:    n.UDPPort,
-		HealthPort: n.HealthPort,
+		Leader:  host,
+		Term:    term,
+		TCPPort: n.TCPPort,
+		UDPPort: n.UDPPort,
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
 }
 
-// Health check nodes and clear leader if unhealthy
+// --- Health check nodes and clear leader if unhealthy ---
 func healthCheckNodes() {
 	for {
 		time.Sleep(200 * time.Millisecond)
@@ -156,7 +241,6 @@ func healthCheckNodes() {
 			if resp != nil && resp.Body != nil {
 				resp.Body.Close()
 			}
-			// If the leader node is unhealthy, clear leader info
 			if node.Address == leader && !node.IsHealthy {
 				leader = ""
 				term = 0
@@ -164,40 +248,6 @@ func healthCheckNodes() {
 		}
 		nodesMutex.Unlock()
 	}
-}
-
-// Dashboard: group by type, show health, last seen, leader, and ports
-func dashboardHandler(w http.ResponseWriter, r *http.Request) {
-	nodesMutex.Lock()
-	defer nodesMutex.Unlock()
-	fmt.Fprint(w, `<html><head><title>Cluster Dashboard</title>
-    <script>
-    setTimeout(function(){ location.reload(); }, 1000);
-    </script>
-    </head><body>`)
-	fmt.Fprint(w, "<h1>Cluster Manager Dashboard</h1>")
-	if leader == "" {
-		fmt.Fprint(w, "<p><b>No leader elected</b></p>")
-	} else {
-		fmt.Fprintf(w, "<p><b>Leader:</b> %s (term %d)</p>", leader, term)
-	}
-	// Group nodes by type
-	types := map[string][]*Node{}
-	for _, n := range nodes {
-		types[n.Type] = append(types[n.Type], n)
-	}
-	for nodeType, nodeList := range types {
-		fmt.Fprintf(w, "<h2>%s Nodes</h2><table border=1><tr><th>Address</th><th>TCP Port</th><th>UDP Port</th><th>Health Port</th><th>Healthy</th><th>Last Seen</th></tr>", strings.Title(nodeType))
-		for _, n := range nodeList {
-			status := "NO"
-			if n.IsHealthy {
-				status = "YES"
-			}
-			fmt.Fprintf(w, "<tr><td>%s</td><td>%d</td><td>%d</td><td>%d</td><td>%s</td><td>%s</td></tr>", n.Address, n.TCPPort, n.UDPPort, n.HealthPort, status, n.LastSeen.Format(time.RFC3339))
-		}
-		fmt.Fprint(w, "</table>")
-	}
-	fmt.Fprint(w, "</body></html>")
 }
 
 // --- Raft Leader Notification Handler ---
@@ -212,7 +262,6 @@ func raftLeaderHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	nodesMutex.Lock()
 	defer nodesMutex.Unlock()
-	// Only update if term is newer or leader is empty
 	if req.Term > term || leader == "" || leader != req.Address {
 		leader = req.Address
 		term = req.Term
@@ -221,15 +270,24 @@ func raftLeaderHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
+// --- Cluster manager health endpoint ---
+func healthHandler(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("ok"))
+}
+
 func main() {
-	http.HandleFunc("/", dashboardHandler)
 	http.HandleFunc("/nodes/register", registerHandler)
 	http.HandleFunc("/nodes/unregister", unregisterHandler)
 	http.HandleFunc("/nodes", nodesHandler)
+	http.HandleFunc("/bad-nodes", badNodesHandler)
 	http.HandleFunc("/storage-nodes", storageNodesHandler)
 	http.HandleFunc("/ingestor-nodes", ingestorNodesHandler)
 	http.HandleFunc("/leader", leaderHandler)
 	http.HandleFunc("/nodes/raft-leader", raftLeaderHandler)
+	http.HandleFunc("/metrics", metricsHandler)
+	http.HandleFunc("/cluster/health", healthHandler)
+	http.HandleFunc("/schema-service", schemaServiceHandler)
 	go healthCheckNodes()
 	addr := os.Getenv("CLUSTER_MANAGER_ADDR")
 	if addr == "" {

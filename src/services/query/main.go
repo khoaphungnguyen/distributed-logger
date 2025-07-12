@@ -2,16 +2,31 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"hash/crc32"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
+	"runtime"
 	"sort"
+	"strconv"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
+)
+
+// Add global metrics counters
+var (
+	totalQueries   int64
+	totalErrors    int64
+	totalLatencyUs int64
+	queriesPerSec  int64
+	errorsPerSec   int64
+	selfAddr       string
 )
 
 type LogEntry struct {
@@ -146,8 +161,12 @@ func periodicallyUpdateStorageNodes() {
 
 // --- Query Handler with Read Repair ---
 func queryHandler(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	atomic.AddInt64(&totalQueries, 1)
+
 	var req QueryRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		atomic.AddInt64(&totalErrors, 1)
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
@@ -250,15 +269,117 @@ collectLoop:
 	}
 
 	json.NewEncoder(w).Encode(QueryResponse{Results: allResults})
+
+	// Record latency
+	latencyUs := time.Since(start).Microseconds()
+	atomic.AddInt64(&totalLatencyUs, latencyUs)
+}
+
+// Resource metrics helper
+func getResourceMetrics() map[string]interface{} {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	return map[string]interface{}{
+		"cpu_count":  runtime.NumCPU(),
+		"goroutines": runtime.NumGoroutine(),
+		"mem_alloc":  m.Alloc,
+		"mem_sys":    m.Sys,
+		"mem_heap":   m.HeapAlloc,
+		"pid":        os.Getpid(),
+		"hostname":   func() string { h, _ := os.Hostname(); return h }(),
+	}
+}
+
+// Query metrics handler
+func queryMetricsHandler(w http.ResponseWriter, r *http.Request) {
+	queries := atomic.LoadInt64(&totalQueries)
+	errors := atomic.LoadInt64(&totalErrors)
+	latencySum := atomic.LoadInt64(&totalLatencyUs)
+	avgLatency := float64(0)
+	if queries > 0 {
+		avgLatency = float64(latencySum) / float64(queries)
+	}
+	metrics := map[string]interface{}{
+		"service_type":    "query",
+		"service_id":      selfAddr,
+		"total_queries":   queries,
+		"total_errors":    errors,
+		"queries_per_sec": atomic.LoadInt64(&queriesPerSec),
+		"errors_per_sec":  atomic.LoadInt64(&errorsPerSec),
+		"avg_latency_us":  avgLatency,
+		"resource":        getResourceMetrics(),
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(metrics)
+}
+
+func healthHandler(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("ok"))
+}
+
+func registerWithClusterManager(addr string, healthPort int) {
+	body, _ := json.Marshal(map[string]interface{}{
+		"address":     addr,
+		"type":        "query",
+		"health_port": healthPort,
+	})
+	_, err := http.Post(clusterManagerURL+"/nodes/register", "application/json", bytes.NewReader(body))
+	if err != nil {
+		log.Fatalf("Failed to register with cluster manager: %v", err)
+	}
+	log.Printf("Registered with cluster manager as %s (health:%d)", addr, healthPort)
+}
+
+func unregisterWithClusterManager(addr string) {
+	body, _ := json.Marshal(map[string]interface{}{
+		"address": addr,
+	})
+	http.Post(clusterManagerURL+"/nodes/unregister", "application/json", bytes.NewReader(body))
+	log.Printf("Unregistered from cluster manager: %s", addr)
+}
+
+// Add this function to periodically update per-second rates:
+func metricsRateLogger() {
+	var lastQueries int64
+	var lastErrors int64
+	for range time.Tick(1 * time.Second) {
+		currQueries := atomic.LoadInt64(&totalQueries)
+		currErrors := atomic.LoadInt64(&totalErrors)
+		atomic.StoreInt64(&queriesPerSec, currQueries-lastQueries)
+		atomic.StoreInt64(&errorsPerSec, currErrors-lastErrors)
+		lastQueries = currQueries
+		lastErrors = currErrors
+	}
 }
 
 func main() {
 	go periodicallyUpdateStorageNodes()
-	http.HandleFunc("/query", queryHandler)
+	go metricsRateLogger()
+
 	port := os.Getenv("QUERY_PORT")
 	if port == "" {
 		port = "8000"
 	}
+	hostname, _ := os.Hostname()
+	selfAddr = fmt.Sprintf("http://%s:%s", hostname, port)
+	healthPort, _ := strconv.Atoi(port)
+
+	registerWithClusterManager(selfAddr, healthPort)
+
+	// Graceful shutdown: unregister on SIGINT/SIGTERM
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	go func() {
+		<-ctx.Done()
+		unregisterWithClusterManager(selfAddr)
+		os.Exit(0)
+	}()
+
+	http.HandleFunc("/query", queryHandler)
+	http.HandleFunc("/metrics", queryMetricsHandler)
+	http.HandleFunc("/cluster/health", healthHandler)
+
 	srv := &http.Server{
 		Addr:         ":" + port,
 		ReadTimeout:  5 * time.Second,

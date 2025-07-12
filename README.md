@@ -361,3 +361,13 @@ Compressed log files are written to:
 - 🔧 **Background Anti-Entropy (Storage):** Each storage node runs a background repair engine that periodically checks its data against peers, repairing itself or others if staleness is detected, inspired by Dynamo/Cassandra anti-entropy.
 - ⚖️ **Dynamic Quorum Configuration:** Both write and read quorums are dynamically calculated based on the number of healthy storage nodes, with sensible minimums for safety and performance.
 - 📈 **Consistency & Availability:** These features together provide strong consistency, high availability, and robust self-healing, making the system production-ready for demanding distributed log workloads.
+
+### 🚀 Day 21 Milestones: Unified Metrics Aggregator & Dashboard
+
+- 📊 **Metrics Aggregator Service:** Introduced a dedicated metrics-aggregator microservice that periodically scrapes metrics from all cluster services (ingestor, storage, query, schema, and cluster-manager).
+- 🖥️ **Unified Cluster Dashboard:** Added a modern, responsive web dashboard that visualizes real-time health, throughput, latency, and error rates for every node and service in the cluster.
+- 🔄 **Live Metrics Collection:** Aggregator collects and normalizes metrics (logs/sec, MB/sec, latency, errors, resource usage, etc.) from all nodes, providing a single source of truth for operational visibility.
+- 🟢 **Health & Status Overview:** Dashboard displays cluster-wide stats, node health, and highlights any bad or unreachable nodes for rapid troubleshooting.
+- 📈 **Consistent Metrics Format:** All services now expose unified `/metrics` endpoints with standardized fields, making it easy to compare and visualize performance across the stack.
+- 🚦 **Auto-Refresh & Drilldown:** Dashboard auto-refreshes every few seconds and allows users to drill down into individual node stats for detailed inspection.
+- ⚡ **Production-Ready Monitoring:** This milestone delivers a single-pane-of-glass view for operators, enabling proactive monitoring, alerting, and capacity planning for distributed log workloads.

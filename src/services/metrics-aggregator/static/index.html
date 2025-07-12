@@ -1,0 +1,426 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <title>Logger Cluster Dashboard</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link
+      href="https://cdnjs.cloudflare.com/ajax/libs/materialize/1.0.0/css/materialize.min.css"
+      rel="stylesheet"
+    />
+    <link
+      href="https://fonts.googleapis.com/icon?family=Material+Icons"
+      rel="stylesheet"
+    />
+    <style>
+      body {
+        background: #f7f7fa;
+      }
+      .dashboard-header {
+        background: #1967b4;
+        color: #fff;
+        padding: 20px 0 16px 32px;
+        font-size: 2rem;
+        font-weight: 600;
+        letter-spacing: 1px;
+        margin-bottom: 0;
+        border-bottom: 1.5px solid #11539b;
+        box-shadow: 0 1px 8px #0001;
+      }
+      .summary-bar {
+        margin: 0 auto 10px auto;
+        max-width: 1100px;
+        display: flex;
+        align-items: center;
+        justify-content: flex-start;
+        padding: 12px 0 8px 0;
+        gap: 18px;
+      }
+      .pill-badge {
+        display: inline-flex;
+        align-items: center;
+        min-width: 75px;
+        margin-right: 6px;
+        padding: 2.5px 13px 2.5px 10px;
+        border-radius: 12px;
+        color: #fff;
+        font-size: 1em;
+        font-weight: 600;
+        background: #1976d2;
+        height: 28px;
+        transition: background 0.18s;
+        line-height: 1em;
+      }
+      .pill-ingestor {
+        background: #2878c4;
+      }
+      .pill-query {
+        background: #d81b60;
+      }
+      .pill-schema {
+        background: #43a047;
+      }
+      .pill-storage {
+        background: #f39c12;
+      }
+      .pill-manager {
+        background: #6c4db4;
+      }
+      .badge-icon {
+        font-size: 19px;
+        margin-right: 5px;
+        vertical-align: -2px;
+      }
+      .summary-bar-right {
+        margin-left: auto;
+        display: flex;
+        flex-direction: column;
+        align-items: flex-end;
+        gap: 2px;
+      }
+      .refresh-btn {
+        min-width: 120px;
+      }
+      .last-refresh {
+        color: #555;
+        font-size: 0.98em;
+        margin-top: 4px;
+        margin-bottom: 0;
+      }
+      .container {
+        max-width: 1100px;
+      }
+      .table-section {
+        margin-top: 22px;
+      }
+      table.striped th,
+      table.striped td {
+        font-size: 1em;
+      }
+      table thead {
+        background: #f3f3f8;
+      }
+      .node-status.healthy {
+        background: #43a047;
+        color: #fff;
+        padding: 0 10px;
+        border-radius: 10px;
+        font-size: 0.97em;
+      }
+      .node-status.unhealthy {
+        background: #e53935;
+        color: #fff;
+        padding: 0 10px;
+        border-radius: 10px;
+        font-size: 0.97em;
+      }
+      .details-link {
+        cursor: pointer;
+        color: #1976d2;
+        text-decoration: underline;
+      }
+      .details-link:hover {
+        text-decoration: none;
+        color: #1257a6;
+      }
+      .expand-row {
+        background: #f5faff;
+        border-top: 1px solid #e7ecf3;
+      }
+      .expand-table td,
+      .expand-table th {
+        padding: 0.3rem 1.1rem !important;
+        font-size: 0.99em;
+      }
+      .expand-table th {
+        background: #e5ebf0 !important;
+      }
+      .expand-content {
+        padding: 8px 0 8px 16px;
+      }
+      .manager-row {
+        background: #eee8f9 !important;
+        font-weight: 600;
+      }
+      .manager-badge {
+        background: #6c4db4;
+        color: #fff;
+        border-radius: 7px;
+        font-size: 0.94em;
+        padding: 2px 9px;
+        margin-left: 6px;
+      }
+      .leader-indicator {
+        color: #ffab00;
+        margin-left: 6px;
+        font-size: 1.1em;
+      }
+      .type-cell {
+        font-weight: 500;
+      }
+      .table-striped > tbody > tr:nth-of-type(odd) > * {
+        background-color: #fcfcfc;
+      }
+      @media (max-width: 1100px) {
+        .dashboard-header,
+        .container,
+        .summary-bar {
+          max-width: 98vw;
+        }
+        table {
+          font-size: 0.97em;
+        }
+        .expand-table th,
+        .expand-table td {
+          font-size: 0.95em;
+        }
+      }
+      @media (max-width: 770px) {
+        .summary-bar {
+          flex-wrap: wrap;
+          gap: 7px;
+        }
+        .summary-bar-right {
+          align-items: flex-start;
+        }
+        .container {
+          padding-left: 0 !important;
+          padding-right: 0 !important;
+        }
+        .dashboard-header {
+          font-size: 1.15rem;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="dashboard-header">Logger Cluster Dashboard</div>
+    <div class="summary-bar">
+      <span class="pill-badge pill-ingestor">
+        <i class="material-icons badge-icon">call_merge</i>Ingestor:<span
+          id="ingestor-count"
+        ></span>
+      </span>
+      <span class="pill-badge pill-query">
+        <i class="material-icons badge-icon">search</i>Query:<span
+          id="query-count"
+        ></span>
+      </span>
+      <span class="pill-badge pill-schema">
+        <i class="material-icons badge-icon">schema</i>Schema:<span
+          id="schema-count"
+        ></span>
+      </span>
+      <span class="pill-badge pill-storage">
+        <i class="material-icons badge-icon">dns</i>Storage:<span
+          id="storage-count"
+        ></span>
+      </span>
+      <span class="pill-badge pill-manager">
+        <i class="material-icons badge-icon">groups</i>Manager: 1
+      </span>
+      <span class="summary-bar-right">
+        <a class="waves-effect waves-light btn refresh-btn" onclick="refresh()">
+          <i class="material-icons left">refresh</i>REFRESH
+        </a>
+        <span class="last-refresh" id="last-refresh"></span>
+      </span>
+    </div>
+
+    <div class="container">
+      <div class="table-section">
+        <h5 style="font-weight: 600; margin-bottom: 0.8em">Cluster Nodes</h5>
+        <table class="striped table-striped" id="nodes-table">
+          <thead>
+            <tr>
+              <th>Host</th>
+              <th>Status</th>
+              <th>Type</th>
+              <th>CPU</th>
+              <th>Goroutines</th>
+              <th>Mem Alloc (MB)</th>
+              <th>Sys Mem (MB)</th>
+              <th>Details</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/materialize/1.0.0/js/materialize.min.js"></script>
+    <script>
+      // Convert bytes to MB
+      function toMB(x) {
+        return x ? Math.round(Number(x) / 1024 / 1024) : 0;
+      }
+      function niceType(t) {
+        if (t === "cluster-manager") return "Manager";
+        return t.charAt(0).toUpperCase() + t.slice(1);
+      }
+      function metricsFieldsByType(type) {
+        if (type === "ingestor")
+          return [
+            ["Logs/sec", "logs_per_sec"],
+            ["MB/sec", "mb_per_sec"],
+            ["Dropped", "dropped"],
+            ["Latency (us)", "latency_us"],
+          ];
+        if (type === "storage")
+          return [
+            ["Logs/sec", "logs_per_sec"],
+            ["MB/sec", "mb_per_sec"],
+            ["Dropped", "dropped"],
+          ];
+        if (type === "query")
+          return [
+            ["Total Queries", "total_queries"],
+            ["Avg Latency (us)", "avg_latency_us"],
+            ["Total Errors", "total_errors"],
+          ];
+        if (type === "schema")
+          return [
+            ["Schema Count", "schema_count"],
+            ["Validations", "validation_count"],
+            ["Errors", "validation_errors"],
+          ];
+        if (type === "cluster-manager")
+          return [
+            ["Term", "term"],
+            ["Service", "service_type"],
+          ];
+        return [];
+      }
+
+      let expandStates = [];
+      let sortedNodeRows = [];
+      let nodeDetails = [];
+
+      function refresh() {
+        fetch("/metrics")
+          .then((r) => r.json())
+          .then((data) => {
+            // Cluster state summary
+            const healthy = data.cluster_stats.healthy_nodes || {};
+            document.getElementById("ingestor-count").textContent =
+              healthy.ingestor ? " " + healthy.ingestor : " 0";
+            document.getElementById("query-count").textContent = healthy.query
+              ? " " + healthy.query
+              : " 0";
+            document.getElementById("schema-count").textContent = healthy.schema
+              ? " " + healthy.schema
+              : " 0";
+            document.getElementById("storage-count").textContent =
+              healthy.storage ? " " + healthy.storage : " 0";
+            document.getElementById("last-refresh").textContent =
+              "Last refresh: " + new Date().toLocaleTimeString();
+
+            // Build node rows
+            let rows = [],
+              idx = 0,
+              managerHost = "";
+            nodeDetails = [];
+            // cluster manager resource node
+            let cm = data.cluster_stats || {};
+            if (cm.resource) {
+              let host =
+                cm.resource.hostname ||
+                (cm.leader || "").split("://")[1]?.split(":")[0] ||
+                "manager";
+              managerHost = host;
+              rows.push({
+                Node: {
+                  address: host,
+                  type: "cluster-manager",
+                  is_healthy: true,
+                },
+                Metrics: { resource: cm.resource, ...cm },
+                __idx: idx,
+              });
+              idx++;
+            }
+            // then others
+            for (const [addr, nm] of Object.entries(data.node_metrics || {})) {
+              let res = nm.Metrics.resource || {};
+              if (res.hostname !== managerHost) {
+                rows.push({ ...nm, __idx: idx });
+                idx++;
+              }
+            }
+            sortedNodeRows = rows;
+            if (!expandStates || expandStates.length !== rows.length)
+              expandStates = new Array(rows.length).fill(false);
+
+            // Render rows
+            let tbody = "";
+            rows.forEach((nm, i) => {
+              const m = nm.Metrics || {};
+              const res = m.resource || {};
+              const node = nm.Node || {};
+              const isHealthy = node.is_healthy ? "healthy" : "unhealthy";
+              const typeCell = `<span class="type-cell">${niceType(
+                node.type
+              )}</span>`;
+              // manager row highlight
+              const managerRowClass =
+                node.type === "cluster-manager" ? "manager-row" : "";
+              tbody += `<tr class="${managerRowClass}">
+            <td>${
+              res.hostname ||
+              (node.address || "").split("://")[1]?.split(":")[0]
+            }</td>
+            <td><span class="node-status ${isHealthy}">${
+                node.is_healthy ? "Healthy" : "Unhealthy"
+              }</span></td>
+            <td>${typeCell}${
+                node.type === "cluster-manager"
+                  ? '<span class="manager-badge">Manager</span>'
+                  : ""
+              }</td>
+            <td>${res.cpu_count || ""}</td>
+            <td>${res.goroutines || ""}</td>
+            <td>${toMB(res.mem_alloc)}</td>
+            <td>${toMB(res.mem_sys)}</td>
+            <td><a class="details-link" onclick="toggleExpand(${i})">${
+                expandStates[i] ? "Hide" : "View"
+              }</a></td>
+          </tr>`;
+              if (expandStates[i]) {
+                tbody += `<tr class="expand-row"><td colspan="8"><div class="expand-content">
+              ${renderDetailsTable(node.type, nm)}
+            </div></td></tr>`;
+              }
+            });
+            document.querySelector("#nodes-table tbody").innerHTML = tbody;
+          });
+      }
+
+      function renderDetailsTable(type, nm) {
+        const m = nm.Metrics || {};
+        let fields = metricsFieldsByType(type);
+        if (fields.length === 0)
+          return "<span style='color:#777;'>No extra metrics available.</span>";
+        let html = '<table class="expand-table"><thead><tr>';
+        fields.forEach(([label]) => {
+          html += `<th>${label}</th>`;
+        });
+        html += "</tr></thead><tbody><tr>";
+        fields.forEach(([_, key]) => {
+          html += `<td>${m[key] !== undefined ? m[key] : "-"}</td>`;
+        });
+        html += "</tr></tbody></table>";
+        return html;
+      }
+
+      function toggleExpand(i) {
+        expandStates[i] = !expandStates[i];
+        refresh();
+      }
+      window.toggleExpand = toggleExpand;
+
+      document.addEventListener("DOMContentLoaded", function () {
+        refresh();
+        setInterval(refresh, 1000);
+      });
+    </script>
+  </body>
+</html>

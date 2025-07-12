@@ -55,9 +55,7 @@ var (
 
 	lastHeartbeat   = time.Now()
 	electionResetCh = make(chan struct{}, 1)
-	selfAddr        string // set at runtime
-
-	healthPort int
+	selfAddr        string
 )
 
 // --- Raft Heartbeat Handler ---
@@ -131,7 +129,7 @@ func updatePeers() {
 	var addrs []string
 	for _, n := range nodes {
 		if n.IsHealthy && n.Address != selfAddr {
-			addrs = append(addrs, n.Address+fmt.Sprintf(":%d", n.HealthPort))
+			addrs = append(addrs, n.Address)
 		}
 	}
 	sort.Strings(addrs)
@@ -273,19 +271,18 @@ var (
 	storageRing        *hashRing
 )
 
-func registerWithClusterManager(addr string, tcpPort, udpPort, healthPort int) {
+func registerWithClusterManager(addr string, tcpPort, udpPort int) {
 	body, _ := json.Marshal(map[string]interface{}{
-		"address":     addr,
-		"type":        "ingestor",
-		"tcp_port":    tcpPort,
-		"udp_port":    udpPort,
-		"health_port": healthPort,
+		"address":  addr,
+		"type":     "ingestor",
+		"tcp_port": tcpPort,
+		"udp_port": udpPort,
 	})
 	_, err := http.Post(clusterManagerAddr+"/nodes/register", "application/json", bytes.NewReader(body))
 	if err != nil {
 		log.Fatalf("Failed to register with cluster manager: %v", err)
 	}
-	log.Printf("Registered with cluster manager as %s (tcp:%d, udp:%d, health:%d)", addr, tcpPort, udpPort, healthPort)
+	log.Printf("Registered with cluster manager as %s (tcp:%d, udp:%d)", addr, tcpPort, udpPort)
 }
 
 func unregisterWithClusterManager(addr string) {
@@ -577,29 +574,7 @@ func partitionBatchWorker(idx int) {
 
 // ========== METRICS & DASHBOARD ==========
 
-type MetricsSnapshot struct {
-	LogsPerSec   int64
-	MBPerSec     float64
-	LatencyUs    float64
-	Dropped      int64
-	FormatCounts map[string]int64
-}
-
 var (
-	sampleMutex sync.Mutex
-	sampleLogs  = map[string][]string{
-		"json":     {},
-		"proto":    {},
-		"avro":     {},
-		"raw":      {},
-		"syslog":   {},
-		"journald": {},
-	}
-	sampleLimit = 3
-)
-
-var (
-	lastMetrics  MetricsSnapshot
 	metricsMutex sync.Mutex
 	processCount int64
 	totalBytes   int64
@@ -630,28 +605,14 @@ func metricsLogger() {
 		if latCount > 0 {
 			avgLatency = float64(totalLat) / float64(latCount)
 		}
-		numGoroutines := runtime.NumGoroutine()
-
-		formatSnapshot := make(map[string]int64)
-		for k, v := range formatCounts {
-			formatSnapshot[k] = atomic.LoadInt64(v)
-		}
-
-		lastMetrics = MetricsSnapshot{
-			LogsPerSec:   rate,
-			MBPerSec:     float64(bytesPerSec) / (1024 * 1024),
-			LatencyUs:    avgLatency,
-			Dropped:      dropped,
-			FormatCounts: formatSnapshot,
-		}
 
 		atomic.StoreInt64(&processCount, 0)
 		atomic.StoreInt64(&totalBytes, 0)
 		atomic.StoreInt64(&totalLatency, 0)
 		atomic.StoreInt64(&latencyCount, 0)
 
-		log.Printf("[METRIC] Logs/sec: %d, MB/s: %.2f, Latency: %.2fµs, Goroutines: %d, Dropped: %d",
-			rate, float64(bytesPerSec)/(1024*1024), avgLatency, numGoroutines, dropped)
+		log.Printf("[METRIC] Logs/sec: %d, MB/s: %.2f, Latency: %.2fµs, Dropped: %d",
+			rate, float64(bytesPerSec)/(1024*1024), avgLatency, dropped)
 		metricsMutex.Unlock()
 	}
 }
@@ -661,70 +622,44 @@ func recordLatency(d time.Duration) {
 	atomic.AddInt64(&latencyCount, 1)
 }
 
-func recordSample(format string, entry LogEntry) {
-	sampleMutex.Lock()
-	defer sampleMutex.Unlock()
-	b, _ := json.Marshal(entry)
-	lines := sampleLogs[format]
-	lines = append(lines, string(b))
-	if len(lines) > sampleLimit {
-		lines = lines[len(lines)-sampleLimit:]
-	}
-	sampleLogs[format] = lines
-}
-
-func incrementFormatCount(format string) {
-	if c, ok := formatCounts[format]; ok {
-		atomic.AddInt64(c, 1)
+func getResourceMetrics() map[string]interface{} {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	return map[string]interface{}{
+		"cpu_count":  runtime.NumCPU(),
+		"goroutines": runtime.NumGoroutine(),
+		"mem_alloc":  m.Alloc,
+		"mem_sys":    m.Sys,
+		"mem_heap":   m.HeapAlloc,
+		"pid":        os.Getpid(),
+		"hostname":   func() string { h, _ := os.Hostname(); return h }(),
 	}
 }
 
-func startHTTPServer() {
-	mux := http.NewServeMux()
-	mux.Handle("/", http.FileServer(http.Dir("./static")))
+func metricsHandler(w http.ResponseWriter, r *http.Request) {
+	// Aggregate current values on-demand
+	rate := atomic.LoadInt64(&processCount)
+	bytesPerSec := atomic.LoadInt64(&totalBytes)
+	totalLat := atomic.LoadInt64(&totalLatency)
+	latCount := atomic.LoadInt64(&latencyCount)
+	dropped := atomic.LoadInt64(&droppedLogs)
 
-	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
-		metricsMutex.Lock()
-		snap := lastMetrics
-		metricsMutex.Unlock()
-		sampleMutex.Lock()
-		defer sampleMutex.Unlock()
-		fmt.Fprintf(w, `{"logs_per_sec": %d, "mb_per_sec": %.2f, "latency_us": %.2f, "dropped": %d`,
-			snap.LogsPerSec,
-			snap.MBPerSec,
-			snap.LatencyUs,
-			snap.Dropped,
-		)
-		for k, v := range snap.FormatCounts {
-			fmt.Fprintf(w, `,"%s":%d`, k, v)
-		}
-		fmt.Fprintf(w, `,"samples":{`)
-		first := true
-		for k, v := range sampleLogs {
-			if !first {
-				fmt.Fprint(w, ",")
-			}
-			first = false
-			fmt.Fprintf(w, `"%s":[`, k)
-			for i, s := range v {
-				if i > 0 {
-					fmt.Fprint(w, ",")
-				}
-				fmt.Fprintf(w, "%q", s)
-			}
-			fmt.Fprint(w, "]")
-		}
-		fmt.Fprint(w, "}}")
-	})
-	server := &http.Server{
-		Addr:         ":3000",
-		Handler:      mux,
-		IdleTimeout:  10 * time.Second,
-		ReadTimeout:  5 * time.Second,
-		WriteTimeout: 10 * time.Second,
+	avgLatency := float64(0)
+	if latCount > 0 {
+		avgLatency = float64(totalLat) / float64(latCount)
 	}
-	log.Println("Dashboard available at http://localhost:3000")
-	server.ListenAndServe()
+
+	metrics := map[string]interface{}{
+		"service_type": "ingestor",
+		"service_id":   selfAddr,
+		"logs_per_sec": rate,
+		"mb_per_sec":   float64(bytesPerSec) / (1024 * 1024),
+		"latency_us":   avgLatency,
+		"dropped":      dropped,
+		"resource":     getResourceMetrics(),
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(metrics)
 }
 
 // ========== UNIVERSAL LOG INGESTION SERVERS ==========
@@ -773,10 +708,9 @@ func startUDPServerOnConn(conn *net.UDPConn) {
 			}
 			entry.Hostname, _ = os.Hostname()
 			entry.AppVersion = os.Getenv("APP_VERSION")
-			recordSample("json", entry)
 			enqueueLog(entry)
 			recordLatency(time.Since(start))
-			incrementFormatCount("json")
+
 		}
 		if err := scanner.Err(); err != nil {
 			log.Printf("UDP scanner error: %v", err)
@@ -889,10 +823,8 @@ func handleUniversalConnection(conn net.Conn) {
 		if entry.AppVersion == "" {
 			entry.AppVersion = "unknown"
 		}
-		recordSample(formatType, entry)
 		enqueueLog(entry)
 		recordLatency(time.Since(start))
-		incrementFormatCount(formatType)
 		buf = buf[5+msgLen:]
 	}
 }
@@ -1076,25 +1008,33 @@ func main() {
 	}
 	udpPort := udpConn.LocalAddr().(*net.UDPAddr).Port
 
-	healthListener, err := net.Listen("tcp", ":0")
-	if err != nil {
-		log.Fatalf("Failed to listen for health endpoint: %v", err)
+	ingestorName := os.Getenv("INGESTOR_NAME")
+	if ingestorName == "" {
+		hostname, err := os.Hostname()
+		if err != nil {
+			log.Fatal("STORAGE_NAME must be set and hostname could not be determined")
+		}
+		ingestorName = hostname
 	}
-	healthPort = healthListener.Addr().(*net.TCPAddr).Port
+	ln, err := net.Listen("tcp", ":0") // random port
+	if err != nil {
+		log.Fatalf("Failed to listen: %v", err)
+	}
+	_, port, err := net.SplitHostPort(ln.Addr().String())
+	if err != nil {
+		log.Fatalf("Failed to parse port: %v", err)
+	}
+	addr := fmt.Sprintf("http://%s:%s", ingestorName, port)
+	selfAddr = addr
 
-	hostname, _ := os.Hostname()
-	selfAddr = fmt.Sprintf("http://%s", hostname)
-
-	registerWithClusterManager(selfAddr, tcpPort, udpPort, healthPort)
-
+	registerWithClusterManager(selfAddr, tcpPort, udpPort)
 	go periodicallyUpdateClusterState()
 	go raftElectionLoop()
 	go startTCPServerUniversalOnListener(tcpListener)
 	go startUDPServerOnConn(udpConn)
-	go startHTTPServer()
-	go startClusterHTTPServerOnListener(healthListener)
+	go startClusterHTTPServerOnListener(ln)
 	fetchAndCacheSchemas()
-	//go metricsLogger()
+	// go metricsLogger()
 	for i := 0; i < partitionCount; i++ {
 		partitionChans[i] = make(chan LogEntry, 200000)
 		partitionBatchChans[i] = make(chan []LogEntry)
@@ -1117,8 +1057,22 @@ var (
 )
 
 func fetchAndCacheSchemas() {
+	// Discover schema-validator address from cluster manager
+	resp, err := http.Get(clusterManagerAddr + "/schema-service")
+	if err != nil {
+		log.Fatalf("Failed to get schema service address from cluster manager: %v", err)
+	}
+	defer resp.Body.Close()
+	var schemaInfo struct {
+		Address string `json:"address"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&schemaInfo); err != nil || schemaInfo.Address == "" {
+		log.Fatalf("Failed to decode schema service address: %v", err)
+	}
+	schemaAddr := schemaInfo.Address
+
 	// JSON Schema
-	resp, err := http.Get("http://schema-validator:8000/schema/get?format=json&name=LogEntry")
+	resp, err = http.Get(schemaAddr + "/schema/get?format=json&name=LogEntry")
 	if err != nil {
 		log.Fatalf("Failed to fetch JSON schema: %v", err)
 	}
@@ -1135,7 +1089,7 @@ func fetchAndCacheSchemas() {
 	}
 
 	// Avro Schema
-	resp, err = http.Get("http://schema-validator:8000/schema/get?format=avro&name=LogEntry")
+	resp, err = http.Get(schemaAddr + "/schema/get?format=avro&name=LogEntry")
 	if err != nil {
 		log.Fatalf("Failed to fetch Avro schema: %v", err)
 	}
@@ -1149,7 +1103,7 @@ func fetchAndCacheSchemas() {
 	}
 
 	// Protobuf Descriptor
-	resp, err = http.Get("http://schema-validator:8000/schema/descriptor?name=LogEntry")
+	resp, err = http.Get(schemaAddr + "/schema/descriptor?name=LogEntry")
 	if err != nil {
 		log.Fatalf("Failed to fetch proto descriptor: %v", err)
 	}
@@ -1179,6 +1133,7 @@ func startClusterHTTPServerOnListener(listener net.Listener) {
 	})
 	mux.HandleFunc("/raft/vote", voteHandler)
 	mux.HandleFunc("/raft/heartbeat", heartbeatHandler)
+	mux.HandleFunc("/metrics", metricsHandler)
 	log.Printf("Cluster HTTP endpoints available at %s (listening on %s)", selfAddr, listener.Addr().String())
 	server := &http.Server{
 		Handler:      mux,

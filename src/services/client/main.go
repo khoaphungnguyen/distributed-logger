@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"os/signal"
 	"strconv"
 	"strings"
@@ -181,7 +182,6 @@ type LeaderInfo struct {
 	UDPPort int    `json:"udp_port"`
 }
 
-// Returns host, tcpPort, udpPort, error
 func discoverLeaderWithPorts(clusterManagerURL string) (string, int, int, error) {
 	for retries := 0; retries < 5; retries++ {
 		resp, err := http.Get(clusterManagerURL + "/leader")
@@ -199,21 +199,49 @@ func discoverLeaderWithPorts(clusterManagerURL string) (string, int, int, error)
 			time.Sleep(2 * time.Second)
 			continue
 		}
-		u, err := url.Parse(info.Leader)
-		if err != nil {
+		host := info.Leader
+		// If it's a URL, extract the hostname; if not, use as is
+		if strings.HasPrefix(host, "http") {
+			u, err := url.Parse(host)
+			if err == nil {
+				host = u.Hostname()
+			}
+		}
+		if host == "" {
 			time.Sleep(2 * time.Second)
 			continue
 		}
-		host := u.Hostname()
 		log.Println("Discovered leader:", host, "TCP port:", info.TCPPort, "UDP port:", info.UDPPort)
 		return host, info.TCPPort, info.UDPPort, nil
 	}
 	return "", 0, 0, fmt.Errorf("could not discover leader after retries")
 }
 
+func getSchemaServiceAddr(clusterManagerURL string) (string, error) {
+	resp, err := http.Get(clusterManagerURL + "/schema-service")
+	if err != nil {
+		return "", fmt.Errorf("failed to get schema service address: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := ioutil.ReadAll(resp.Body)
+		return "", fmt.Errorf("schema service discovery failed: %s", string(body))
+	}
+	var schemaInfo struct {
+		Address string `json:"address"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&schemaInfo); err != nil || schemaInfo.Address == "" {
+		return "", fmt.Errorf("failed to decode schema service address: %v", err)
+	}
+	return schemaInfo.Address, nil
+}
+
 // --- Main ---
 func main() {
-	clusterManagerURL := "http://cluster-manager:5000"
+	clusterManagerURL := os.Getenv("CLUSTER_MANAGER_ADDR")
+	if clusterManagerURL == "" {
+		clusterManagerURL = "http://cluster-manager:5000"
+	}
 
 	// Discover leader host and ports before connecting
 	leaderHost, tcpPort, udpPort, err := discoverLeaderWithPorts(clusterManagerURL)
@@ -221,7 +249,12 @@ func main() {
 	if leaderHost == "" || tcpPort == 0 || udpPort == 0 {
 		log.Fatalf("Could not discover leader host/ports: %v", err)
 	}
-	//log.Printf("Connecting to ingestor at %s (TCP:%d, UDP:%d)", leaderHost, tcpPort, udpPort)
+
+	// Discover schema-validator address from cluster manager
+	schemaRegistryURL, err := getSchemaServiceAddr(clusterManagerURL)
+	if err != nil {
+		log.Fatalf("Could not discover schema service: %v", err)
+	}
 
 	rand.Seed(time.Now().UnixNano())
 
@@ -259,7 +292,6 @@ func main() {
 
 	ticker := time.NewTicker(time.Duration(*intervalMs) * time.Millisecond)
 	defer ticker.Stop()
-	schemaRegistryURL := "http://schema-validator:8000"
 
 	// --- Dynamic schema fetching ---
 	jsonSchemaStr, avroSchemaStr := "", ""

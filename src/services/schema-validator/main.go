@@ -5,9 +5,17 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
+	"net"
 	"net/http"
+	"os"
+	"os/signal"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
 
 	"github.com/hamba/avro/v2"
 	"github.com/xeipuuv/gojsonschema"
@@ -39,23 +47,88 @@ var (
 	protoMsgDescCache = make(map[string]protoreflect.MessageDescriptor) // key: name
 )
 
-func main() {
-	// Load FileDescriptorSet (compiled from .proto) at startup
-	loadProtoDescriptors("schema/logentry.desc") // path to your descriptor set
+var (
+	validationCount     int64
+	validationErrors    int64
+	validationLatencyUs int64
+	validationsPerSec   int64
+	errorsPerSec        int64
+)
 
-	// Auto-register all schemas from ./schema/ at startup
-	registerSchemasFromDir("./schema")
+var (
+	clusterManagerAddr = os.Getenv("CLUSTER_MANAGER_ADDR")
+	selfAddr           string
+)
 
-	http.HandleFunc("/schema/register", schemaRegisterHandler)
-	http.HandleFunc("/schema/get", schemaGetHandler)
-	http.HandleFunc("/schema/list", schemaListHandler)
-	http.HandleFunc("/schema/validate", schemaValidateHandler)
-	http.HandleFunc("/schema/descriptor", schemaDescriptorHandler)
-	log.Println("Schema Registry API available at :8000")
-	log.Fatal(http.ListenAndServe(":8000", nil))
+// Register with cluster manager
+func registerWithClusterManager(addr string) {
+	if clusterManagerAddr == "" {
+		log.Println("CLUSTER_MANAGER_ADDR not set, skipping registration")
+		return
+	}
+	body, _ := json.Marshal(map[string]string{
+		"address": addr,
+		"type":    "schema",
+	})
+	_, err := http.Post(clusterManagerAddr+"/nodes/register", "application/json", strings.NewReader(string(body)))
+	if err != nil {
+		log.Printf("Failed to register with cluster manager: %v", err)
+	} else {
+		log.Printf("Registered with cluster manager as %s", addr)
+	}
 }
 
-// Load FileDescriptorSet and cache message descriptors
+func unregisterWithClusterManager(addr string) {
+	if clusterManagerAddr == "" {
+		return
+	}
+	body, _ := json.Marshal(map[string]string{
+		"address": addr,
+	})
+	http.Post(clusterManagerAddr+"/nodes/unregister", "application/json", strings.NewReader(string(body)))
+	log.Printf("Unregistered from cluster manager")
+}
+
+// --- Metrics Handler ---
+func getResourceMetrics() map[string]interface{} {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	return map[string]interface{}{
+		"cpu_count":  runtime.NumCPU(),
+		"goroutines": runtime.NumGoroutine(),
+		"mem_alloc":  m.Alloc,
+		"mem_sys":    m.Sys,
+		"mem_heap":   m.HeapAlloc,
+		"pid":        os.Getpid(),
+		"hostname":   func() string { h, _ := os.Hostname(); return h }(),
+	}
+}
+
+func metricsHandler(w http.ResponseWriter, r *http.Request) {
+	schemaMutex.RLock()
+	schemaCount := len(schemaStore)
+	schemaMutex.RUnlock()
+	validations := atomic.LoadInt64(&validationCount)
+	//errors := atomic.LoadInt64(&validationErrors)
+	latencySum := atomic.LoadInt64(&validationLatencyUs)
+	avgLatency := float64(0)
+	if validations > 0 {
+		avgLatency = float64(latencySum) / float64(validations)
+	}
+	metrics := map[string]interface{}{
+		"service_type":        "schema",
+		"service_id":          selfAddr,
+		"schema_count":        schemaCount,
+		"validations_per_sec": atomic.LoadInt64(&validationsPerSec),
+		"avg_latency_us":      avgLatency,
+		"errors_per_sec":      atomic.LoadInt64(&errorsPerSec),
+		"resource":            getResourceMetrics(),
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(metrics)
+}
+
+// --- Load FileDescriptorSet and cache message descriptors ---
 func loadProtoDescriptors(descPath string) {
 	descBytes, err := ioutil.ReadFile(descPath)
 	if err != nil {
@@ -81,7 +154,7 @@ func loadProtoDescriptors(descPath string) {
 	}
 }
 
-// Register all *.json files in the given directory as schemas
+// --- Register all *.json files in the given directory as schemas ---
 func registerSchemasFromDir(dir string) {
 	files, err := ioutil.ReadDir(dir)
 	if err != nil {
@@ -132,6 +205,7 @@ func registerSchemasFromDir(dir string) {
 	}
 }
 
+// --- Schema Registration Handler ---
 func schemaRegisterHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "POST required", http.StatusMethodNotAllowed)
@@ -164,6 +238,7 @@ func schemaRegisterHandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "Registered schema %s", key)
 }
 
+// --- Schema Get Handler ---
 func schemaGetHandler(w http.ResponseWriter, r *http.Request) {
 	format := r.URL.Query().Get("format")
 	name := r.URL.Query().Get("name")
@@ -178,6 +253,7 @@ func schemaGetHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(s)
 }
 
+// --- Schema List Handler ---
 func schemaListHandler(w http.ResponseWriter, r *http.Request) {
 	schemaMutex.RLock()
 	defer schemaMutex.RUnlock()
@@ -188,10 +264,8 @@ func schemaListHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(schemas)
 }
 
-// GET /schema/descriptor?name=LogEntry
+// --- Schema Descriptor Handler ---
 func schemaDescriptorHandler(w http.ResponseWriter, r *http.Request) {
-	//name := r.URL.Query().Get("name")
-	// For demo, always serve the same descriptor set file
 	descBytes, err := ioutil.ReadFile("schema/logentry.desc")
 	if err != nil {
 		http.Error(w, "Descriptor not found", http.StatusNotFound)
@@ -201,9 +275,9 @@ func schemaDescriptorHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write(descBytes)
 }
 
-// POST /schema/validate
-// Body: { "format": "json|avro|proto", "name": "LogEntry", "data": {...} }
+// --- Schema Validate Handler ---
 func schemaValidateHandler(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
 	if r.Method != http.MethodPost {
 		http.Error(w, "POST required", http.StatusMethodNotAllowed)
 		return
@@ -211,9 +285,11 @@ func schemaValidateHandler(w http.ResponseWriter, r *http.Request) {
 	var req ValidateRequest
 	body, _ := ioutil.ReadAll(r.Body)
 	if err := json.Unmarshal(body, &req); err != nil {
+		atomic.AddInt64(&validationErrors, 1)
 		http.Error(w, "Invalid JSON", http.StatusBadRequest)
 		return
 	}
+	atomic.AddInt64(&validationCount, 1)
 	key := req.Format + ":" + req.Name
 
 	switch req.Format {
@@ -222,6 +298,7 @@ func schemaValidateHandler(w http.ResponseWriter, r *http.Request) {
 		schema, ok := jsonSchemaCache[key]
 		schemaMutex.RUnlock()
 		if !ok {
+			atomic.AddInt64(&validationErrors, 1)
 			http.Error(w, "Schema not found", http.StatusNotFound)
 			return
 		}
@@ -229,10 +306,12 @@ func schemaValidateHandler(w http.ResponseWriter, r *http.Request) {
 		docLoader := gojsonschema.NewBytesLoader(b)
 		result, err := schema.Validate(docLoader)
 		if err != nil {
+			atomic.AddInt64(&validationErrors, 1)
 			http.Error(w, fmt.Sprintf("Validation error: %v", err), http.StatusBadRequest)
 			return
 		}
 		if !result.Valid() {
+			atomic.AddInt64(&validationErrors, 1)
 			http.Error(w, fmt.Sprintf("Validation failed: %v", result.Errors()), http.StatusBadRequest)
 			return
 		}
@@ -244,17 +323,20 @@ func schemaValidateHandler(w http.ResponseWriter, r *http.Request) {
 		avroSchema, ok := avroSchemaCache[key]
 		schemaMutex.RUnlock()
 		if !ok {
+			atomic.AddInt64(&validationErrors, 1)
 			http.Error(w, "Schema not found", http.StatusNotFound)
 			return
 		}
 		b, _ := json.Marshal(req.Data)
 		var native interface{}
 		if err := json.Unmarshal(b, &native); err != nil {
+			atomic.AddInt64(&validationErrors, 1)
 			http.Error(w, "Invalid Avro data", http.StatusBadRequest)
 			return
 		}
 		_, err := avro.Marshal(avroSchema, native)
 		if err != nil {
+			atomic.AddInt64(&validationErrors, 1)
 			http.Error(w, fmt.Sprintf("Avro validation failed: %v", err), http.StatusBadRequest)
 			return
 		}
@@ -262,15 +344,16 @@ func schemaValidateHandler(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("Validation successful"))
 		return
 	case "proto":
-		// Use dynamicpb for runtime validation
 		msgDesc, ok := protoMsgDescCache[req.Name]
 		if !ok {
+			atomic.AddInt64(&validationErrors, 1)
 			http.Error(w, "Unknown proto message type", http.StatusBadRequest)
 			return
 		}
 		msg := dynamicpb.NewMessage(msgDesc)
 		b, _ := json.Marshal(req.Data)
 		if err := protojson.Unmarshal(b, msg); err != nil {
+			atomic.AddInt64(&validationErrors, 1)
 			http.Error(w, fmt.Sprintf("Protobuf validation failed: %v", err), http.StatusBadRequest)
 			return
 		}
@@ -279,5 +362,68 @@ func schemaValidateHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	atomic.AddInt64(&validationErrors, 1)
 	http.Error(w, "Validation for this format not implemented", http.StatusNotImplemented)
+	atomic.AddInt64(&validationLatencyUs, time.Since(start).Microseconds())
+}
+
+func metricsRateLogger() {
+	var lastValidations int64
+	var lastErrors int64
+	for range time.Tick(1 * time.Second) {
+		currValidations := atomic.LoadInt64(&validationCount)
+		currErrors := atomic.LoadInt64(&validationErrors)
+		atomic.StoreInt64(&validationsPerSec, currValidations-lastValidations)
+		atomic.StoreInt64(&errorsPerSec, currErrors-lastErrors)
+		lastValidations = currValidations
+		lastErrors = currErrors
+	}
+}
+
+func main() {
+	// Load FileDescriptorSet (compiled from .proto) at startup
+	loadProtoDescriptors("schema/logentry.desc") // path to your descriptor set
+
+	// Auto-register all schemas from ./schema/ at startup
+	registerSchemasFromDir("./schema")
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/schema/register", schemaRegisterHandler)
+	mux.HandleFunc("/schema/get", schemaGetHandler)
+	mux.HandleFunc("/schema/list", schemaListHandler)
+	mux.HandleFunc("/schema/validate", schemaValidateHandler)
+	mux.HandleFunc("/schema/descriptor", schemaDescriptorHandler)
+	mux.HandleFunc("/metrics", metricsHandler)
+	mux.HandleFunc("/cluster/health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ok"))
+	})
+
+	// Listen on a random port
+	ln, err := net.Listen("tcp", ":0")
+	if err != nil {
+		log.Fatalf("Failed to listen: %v", err)
+	}
+	_, port, err := net.SplitHostPort(ln.Addr().String())
+	if err != nil {
+		log.Fatalf("Failed to parse port: %v", err)
+	}
+	hostname, _ := os.Hostname()
+	selfAddr = fmt.Sprintf("http://%s:%s", hostname, port)
+
+	// Register with cluster manager
+	registerWithClusterManager(selfAddr)
+	defer unregisterWithClusterManager(selfAddr)
+
+	// Graceful shutdown
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigChan
+		unregisterWithClusterManager(selfAddr)
+		os.Exit(0)
+	}()
+
+	log.Printf("Schema Registry API available at %s", selfAddr)
+	log.Fatal(http.Serve(ln, mux))
 }

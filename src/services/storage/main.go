@@ -78,10 +78,9 @@ var (
 	storageNodes      []string
 	storageNodesMutex sync.RWMutex
 	storageRing       *hashRing
-	replicaCount      = 3 // Should match ingestor/query
+	replicaCount      int // Should match ingestor/query
 )
 
-// Update storageNodes and ring periodically (call this in main)
 func updateStorageNodes() {
 	resp, err := http.Get(clusterManagerAddr + "/storage-nodes")
 	if err != nil {
@@ -106,6 +105,8 @@ func updateStorageNodes() {
 	storageNodesMutex.Lock()
 	storageNodes = addrs
 	storageRing = newHashRing(addrs, 100)
+	// Dynamically set replicaCount based on healthy nodes
+	replicaCount = len(addrs) / 2
 	storageNodesMutex.Unlock()
 }
 
@@ -272,13 +273,21 @@ func partitionBufferWriter(partition string, buf chan LogEntry) {
 		return
 	}
 	defer f.Close()
-	encoder := json.NewEncoder(f)
 	for entry := range buf {
-		encoder.Encode(entry)
+		start := time.Now() // Start timing
+
+		// Encode and write entry
+		var b bytes.Buffer
+		enc := json.NewEncoder(&b)
+		enc.Encode(entry)
+		n, _ := f.Write(b.Bytes())
+
 		atomic.AddInt64(&processCount, 1)
+		atomic.AddInt64(&totalBytes, int64(n))
+		atomic.AddInt64(&totalLatency, time.Since(start).Microseconds())
+		atomic.AddInt64(&latencyCount, 1)
 	}
 }
-
 func writeLogBatchBuffered(entries []LogEntry) {
 	for _, entry := range entries {
 		partition := getPartitionKey(entry)
@@ -677,18 +686,46 @@ func repairHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("repaired"))
 }
 
+func getResourceMetrics() map[string]interface{} {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	return map[string]interface{}{
+		"cpu_count":  runtime.NumCPU(),
+		"goroutines": runtime.NumGoroutine(),
+		"mem_alloc":  m.Alloc,
+		"mem_sys":    m.Sys,
+		"mem_heap":   m.HeapAlloc,
+		"pid":        os.Getpid(),
+		"hostname":   func() string { h, _ := os.Hostname(); return h }(),
+	}
+}
+
+func storageMetricsHandler(w http.ResponseWriter, r *http.Request) {
+	metrics := map[string]interface{}{
+		"service_type": "storage",
+		"service_id":   selfAddr,
+		"logs_per_sec": atomic.LoadInt64(&processCount),
+		"mb_per_sec":   float64(atomic.LoadInt64(&totalBytes)) / (1024 * 1024),
+		"dropped":      atomic.LoadInt64(&droppedLogs),
+		"resource":     getResourceMetrics(),
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(metrics)
+}
+
 func main() {
 	os.MkdirAll(dataDir, 0755)
 	buildPartitionIndex()
 	go compressOldFiles(3)
 	go periodicallyUpdateStorageNodes()
 	go readRepairEngine()
-	//go metricsLogger()
+	// go metricsLogger()
 	http.HandleFunc("/ingest/batch", batchLogHandler)
 	http.HandleFunc("/query", queryHandler)
 	http.HandleFunc("/cluster/health", healthHandler)
 	http.HandleFunc("/repair", repairHandler)
 	http.HandleFunc("/get_entry", getEntryHandler)
+	http.HandleFunc("/metrics", storageMetricsHandler)
 
 	storageName := os.Getenv("STORAGE_NAME")
 	if storageName == "" {
