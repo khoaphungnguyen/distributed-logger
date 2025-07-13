@@ -105,11 +105,7 @@ func getResourceMetrics() map[string]interface{} {
 }
 
 func metricsHandler(w http.ResponseWriter, r *http.Request) {
-	schemaMutex.RLock()
-	schemaCount := len(schemaStore)
-	schemaMutex.RUnlock()
 	validations := atomic.LoadInt64(&validationCount)
-	//errors := atomic.LoadInt64(&validationErrors)
 	latencySum := atomic.LoadInt64(&validationLatencyUs)
 	avgLatency := float64(0)
 	if validations > 0 {
@@ -118,10 +114,9 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 	metrics := map[string]interface{}{
 		"service_type":        "schema",
 		"service_id":          selfAddr,
-		"schema_count":        schemaCount,
 		"validations_per_sec": atomic.LoadInt64(&validationsPerSec),
 		"avg_latency_us":      avgLatency,
-		"errors_per_sec":      atomic.LoadInt64(&errorsPerSec),
+		"validation_errors":   atomic.LoadInt64(&validationErrors),
 		"resource":            getResourceMetrics(),
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -286,6 +281,7 @@ func schemaValidateHandler(w http.ResponseWriter, r *http.Request) {
 	body, _ := ioutil.ReadAll(r.Body)
 	if err := json.Unmarshal(body, &req); err != nil {
 		atomic.AddInt64(&validationErrors, 1)
+		atomic.AddInt64(&validationLatencyUs, time.Since(start).Microseconds())
 		http.Error(w, "Invalid JSON", http.StatusBadRequest)
 		return
 	}
@@ -299,6 +295,7 @@ func schemaValidateHandler(w http.ResponseWriter, r *http.Request) {
 		schemaMutex.RUnlock()
 		if !ok {
 			atomic.AddInt64(&validationErrors, 1)
+			atomic.AddInt64(&validationLatencyUs, time.Since(start).Microseconds())
 			http.Error(w, "Schema not found", http.StatusNotFound)
 			return
 		}
@@ -307,16 +304,19 @@ func schemaValidateHandler(w http.ResponseWriter, r *http.Request) {
 		result, err := schema.Validate(docLoader)
 		if err != nil {
 			atomic.AddInt64(&validationErrors, 1)
+			atomic.AddInt64(&validationLatencyUs, time.Since(start).Microseconds())
 			http.Error(w, fmt.Sprintf("Validation error: %v", err), http.StatusBadRequest)
 			return
 		}
 		if !result.Valid() {
 			atomic.AddInt64(&validationErrors, 1)
 			http.Error(w, fmt.Sprintf("Validation failed: %v", result.Errors()), http.StatusBadRequest)
+			atomic.AddInt64(&validationLatencyUs, time.Since(start).Microseconds())
 			return
 		}
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("Validation successful"))
+		atomic.AddInt64(&validationLatencyUs, time.Since(start).Microseconds())
 		return
 	case "avro":
 		schemaMutex.RLock()
@@ -324,6 +324,7 @@ func schemaValidateHandler(w http.ResponseWriter, r *http.Request) {
 		schemaMutex.RUnlock()
 		if !ok {
 			atomic.AddInt64(&validationErrors, 1)
+			atomic.AddInt64(&validationLatencyUs, time.Since(start).Microseconds())
 			http.Error(w, "Schema not found", http.StatusNotFound)
 			return
 		}
@@ -331,6 +332,7 @@ func schemaValidateHandler(w http.ResponseWriter, r *http.Request) {
 		var native interface{}
 		if err := json.Unmarshal(b, &native); err != nil {
 			atomic.AddInt64(&validationErrors, 1)
+			atomic.AddInt64(&validationLatencyUs, time.Since(start).Microseconds())
 			http.Error(w, "Invalid Avro data", http.StatusBadRequest)
 			return
 		}
@@ -338,15 +340,18 @@ func schemaValidateHandler(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			atomic.AddInt64(&validationErrors, 1)
 			http.Error(w, fmt.Sprintf("Avro validation failed: %v", err), http.StatusBadRequest)
+			atomic.AddInt64(&validationLatencyUs, time.Since(start).Microseconds())
 			return
 		}
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("Validation successful"))
+		atomic.AddInt64(&validationLatencyUs, time.Since(start).Microseconds())
 		return
 	case "proto":
 		msgDesc, ok := protoMsgDescCache[req.Name]
 		if !ok {
 			atomic.AddInt64(&validationErrors, 1)
+			atomic.AddInt64(&validationLatencyUs, time.Since(start).Microseconds())
 			http.Error(w, "Unknown proto message type", http.StatusBadRequest)
 			return
 		}
@@ -355,15 +360,19 @@ func schemaValidateHandler(w http.ResponseWriter, r *http.Request) {
 		if err := protojson.Unmarshal(b, msg); err != nil {
 			atomic.AddInt64(&validationErrors, 1)
 			http.Error(w, fmt.Sprintf("Protobuf validation failed: %v", err), http.StatusBadRequest)
+			atomic.AddInt64(&validationLatencyUs, time.Since(start).Microseconds())
 			return
 		}
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("Validation successful"))
+		atomic.AddInt64(&validationLatencyUs, time.Since(start).Microseconds())
 		return
 	}
 
 	atomic.AddInt64(&validationErrors, 1)
 	http.Error(w, "Validation for this format not implemented", http.StatusNotImplemented)
+
+	// Record latency for all validation attempts
 	atomic.AddInt64(&validationLatencyUs, time.Since(start).Microseconds())
 }
 
@@ -414,6 +423,9 @@ func main() {
 	// Register with cluster manager
 	registerWithClusterManager(selfAddr)
 	defer unregisterWithClusterManager(selfAddr)
+
+	// Start metrics rate logging
+	go metricsRateLogger()
 
 	// Graceful shutdown
 	sigChan := make(chan os.Signal, 1)

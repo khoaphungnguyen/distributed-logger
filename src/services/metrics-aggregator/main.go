@@ -74,7 +74,6 @@ func fetchClusterStats() {
 
 func scrapeMetrics(addr string) (map[string]interface{}, error) {
 	url := addr + "/metrics"
-	//log.Printf("[SCRAPE] Attempting to scrape metrics from %s", url)
 	resp, err := http.Get(url)
 	if err != nil {
 		log.Printf("[SCRAPE][ERROR] Failed to GET %s: %v", url, err)
@@ -92,7 +91,6 @@ func scrapeMetrics(addr string) (map[string]interface{}, error) {
 		log.Printf("[SCRAPE][ERROR] Failed to decode JSON from %s: %v, body: %s", url, err, string(body))
 		return nil, fmt.Errorf("metrics not JSON: %v", err)
 	}
-	//log.Printf("[SCRAPE] Success from %s", url)
 	return metrics, nil
 }
 
@@ -104,10 +102,8 @@ func metricsScraperLoop() {
 			time.Sleep(scrapeInterval)
 			continue
 		}
-		//log.Printf("[DISCOVERY] Found %d nodes", len(nodes))
 		var wg sync.WaitGroup
 		for _, node := range nodes {
-			//log.Printf("[NODE] %s (%s) healthy=%v", node.Address, node.Type, node.IsHealthy)
 			if !node.IsHealthy {
 				continue
 			}

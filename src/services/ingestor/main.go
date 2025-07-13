@@ -575,14 +575,15 @@ func partitionBatchWorker(idx int) {
 // ========== METRICS & DASHBOARD ==========
 
 var (
-	metricsMutex sync.Mutex
-	processCount int64
-	totalBytes   int64
-	totalLatency int64
-	latencyCount int64
-	droppedLogs  int64
-	rateTicker   = time.NewTicker(1 * time.Second)
-	formatCounts = map[string]*int64{
+	metricsMutex   sync.Mutex
+	processCount   int64
+	totalBytes     int64
+	totalLatency   int64
+	latencyCount   int64
+	droppedLogs    int64
+	rateTicker     = time.NewTicker(1 * time.Second)
+	lastLogsPerSec int64 // stores the last calculated logs/sec
+	formatCounts   = map[string]*int64{
 		"json":     new(int64),
 		"proto":    new(int64),
 		"avro":     new(int64),
@@ -594,26 +595,24 @@ var (
 
 func metricsLogger() {
 	for range rateTicker.C {
-		metricsMutex.Lock()
+
 		rate := atomic.LoadInt64(&processCount)
-		bytesPerSec := atomic.LoadInt64(&totalBytes)
-		totalLat := atomic.LoadInt64(&totalLatency)
-		latCount := atomic.LoadInt64(&latencyCount)
-		dropped := atomic.LoadInt64(&droppedLogs)
+		// bytesPerSec := atomic.LoadInt64(&totalBytes)
+		// totalLat := atomic.LoadInt64(&totalLatency)
+		// latCount := atomic.LoadInt64(&latencyCount)
+		// dropped := atomic.LoadInt64(&droppedLogs)
+		// avgLatency := float64(0)
+		// if latCount > 0 {
+		// 	avgLatency = float64(totalLat) / float64(latCount)
+		// }
 
-		avgLatency := float64(0)
-		if latCount > 0 {
-			avgLatency = float64(totalLat) / float64(latCount)
-		}
-
+		// log.Printf("[METRIC] Logs/sec: %d, MB/s: %.2f, Latency: %.2fµs, Dropped: %d",
+		// 	rate, float64(bytesPerSec)/(1024*1024), avgLatency, dropped)
+		atomic.StoreInt64(&lastLogsPerSec, rate)
 		atomic.StoreInt64(&processCount, 0)
 		atomic.StoreInt64(&totalBytes, 0)
 		atomic.StoreInt64(&totalLatency, 0)
 		atomic.StoreInt64(&latencyCount, 0)
-
-		log.Printf("[METRIC] Logs/sec: %d, MB/s: %.2f, Latency: %.2fµs, Dropped: %d",
-			rate, float64(bytesPerSec)/(1024*1024), avgLatency, dropped)
-		metricsMutex.Unlock()
 	}
 }
 
@@ -638,8 +637,7 @@ func getResourceMetrics() map[string]interface{} {
 
 func metricsHandler(w http.ResponseWriter, r *http.Request) {
 	// Aggregate current values on-demand
-	rate := atomic.LoadInt64(&processCount)
-	bytesPerSec := atomic.LoadInt64(&totalBytes)
+	rate := atomic.LoadInt64(&lastLogsPerSec)
 	totalLat := atomic.LoadInt64(&totalLatency)
 	latCount := atomic.LoadInt64(&latencyCount)
 	dropped := atomic.LoadInt64(&droppedLogs)
@@ -653,7 +651,6 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 		"service_type": "ingestor",
 		"service_id":   selfAddr,
 		"logs_per_sec": rate,
-		"mb_per_sec":   float64(bytesPerSec) / (1024 * 1024),
 		"latency_us":   avgLatency,
 		"dropped":      dropped,
 		"resource":     getResourceMetrics(),
@@ -1034,7 +1031,7 @@ func main() {
 	go startUDPServerOnConn(udpConn)
 	go startClusterHTTPServerOnListener(ln)
 	fetchAndCacheSchemas()
-	// go metricsLogger()
+	go metricsLogger()
 	for i := 0; i < partitionCount; i++ {
 		partitionChans[i] = make(chan LogEntry, 200000)
 		partitionBatchChans[i] = make(chan []LogEntry)

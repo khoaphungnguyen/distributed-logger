@@ -71,6 +71,14 @@ services:
       - storage-1
       - storage-2
       - storage-3
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1G
+        reservations:
+          cpus: "0.5"
+          memory: 256M
 
   metrics-aggregator:
     build:
@@ -98,3 +106,43 @@ services:
       - cluster-manager
       - ingestor-1
       - ingestor-2
+
+  client-2:
+    build:
+      context: ./src/services/client
+    command:
+      ["./client", "--batch", "500", "--interval", "10", "--format", "json"]
+    environment:
+      - CLUSTER_MANAGER_ADDR=http://cluster-manager:5000
+    depends_on:
+      - cluster-manager
+      - ingestor-1
+      - ingestor-2
+
+  client-query:
+    build:
+      context: ./src/services/client
+    command:
+      [
+        "./client",
+        "--queryload",
+        "--queryconcurrency",
+        "2",
+        "--workloadlimit",
+        "100",
+      ]
+    environment:
+      - CLUSTER_MANAGER_ADDR=http://cluster-manager:5000
+    depends_on:
+      - cluster-manager
+      - query
+
+  client-validation:
+    build:
+      context: ./src/services/client
+    command: ["./client", "--validationload", "--queryconcurrency", "2"]
+    environment:
+      - CLUSTER_MANAGER_ADDR=http://cluster-manager:5000
+    depends_on:
+      - cluster-manager
+      - schema-validator

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/binary"
@@ -47,6 +48,13 @@ type LogEntry struct {
 }
 
 var levels = []string{"DEBUG", "INFO", "WARN", "ERROR"}
+
+// Load test result type
+type LoadTestResult struct {
+	latency time.Duration
+	err     error
+}
+
 var services = []string{"auth", "payment", "api", "db", "notification"}
 var messages = []string{
 	"User login successful",
@@ -236,6 +244,26 @@ func getSchemaServiceAddr(clusterManagerURL string) (string, error) {
 	return schemaInfo.Address, nil
 }
 
+// --- Query service address discovery ---
+func getQueryServiceAddr(clusterManagerURL string) (string, error) {
+	resp, err := http.Get(clusterManagerURL + "/query-service")
+	if err != nil {
+		return "", fmt.Errorf("failed to get query service address: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := ioutil.ReadAll(resp.Body)
+		return "", fmt.Errorf("query service discovery failed: %s", string(body))
+	}
+	var queryInfo struct {
+		Address string `json:"address"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&queryInfo); err != nil || queryInfo.Address == "" {
+		return "", fmt.Errorf("failed to decode query service address: %v", err)
+	}
+	return queryInfo.Address, nil
+}
+
 // --- Main ---
 func main() {
 	clusterManagerURL := os.Getenv("CLUSTER_MANAGER_ADDR")
@@ -263,10 +291,42 @@ func main() {
 	intervalMs := flag.Int("interval", 10, "Interval in milliseconds between batches")
 	format := flag.String("format", "json", "Log format: json, proto, avro, or raw")
 	typeName := flag.String("type", "LogEntry", "Schema type name")
+	queryLoad := flag.Bool("queryload", false, "Run load test against query service instead of sending logs")
+	validationLoad := flag.Bool("validationload", false, "Run load test against schema validation service instead of sending logs")
+	queryAddr := flag.String("queryaddr", "", "Query service address (for load test, if empty will auto-discover)")
+	queryConcurrency := flag.Int("queryconcurrency", 10, "Number of concurrent query clients")
+	queryDuration := flag.Int("queryduration", 0, "Duration of query load test in seconds (0 = infinite)")
+	workloadLimit := flag.Int("workloadlimit", 10, "The 'limit' field to send in each query workload request (default 10)")
 	flag.Parse()
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	if *queryLoad {
+		// Auto-discover query address if not set
+		qAddr := *queryAddr
+		if qAddr == "" {
+			qAddr, err = getQueryServiceAddr(clusterManagerURL)
+			if err != nil {
+				log.Fatalf("Could not discover query service: %v", err)
+			}
+			// If the discovered address does not include /query, append it
+			if !strings.HasSuffix(qAddr, "/query") {
+				if strings.HasSuffix(qAddr, "/") {
+					qAddr = qAddr + "query"
+				} else {
+					qAddr = qAddr + "/query"
+				}
+			}
+		}
+		runQueryLoadTest(ctx, qAddr, *queryConcurrency, *queryDuration, *workloadLimit)
+		return
+	}
+
+	if *validationLoad {
+		runValidationLoadTest(ctx, schemaRegistryURL, *queryConcurrency, *queryDuration, *format, *typeName)
+		return
+	}
 
 	var conn net.Conn
 	var addr string
@@ -539,4 +599,244 @@ func splitBatchForUDP(batch []string, maxBytes int) [][]string {
 		result = append(result, current)
 	}
 	return result
+}
+
+// --- Query Load Test ---
+func runQueryLoadTest(ctx context.Context, queryAddr string, concurrency, durationSec int, workloadLimit int) {
+	log.Printf("Starting query load test: addr=%s, concurrency=%d, duration=%ds", queryAddr, concurrency, durationSec)
+	results := make(chan LoadTestResult, 10000)
+	stopCh := make(chan struct{})
+	var total, errors int64
+	var totalLatency int64
+
+	// Use connection pooling and longer timeout
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			MaxIdleConns:        100,
+			MaxIdleConnsPerHost: 10,
+			IdleConnTimeout:     90 * time.Second,
+		},
+	}
+
+	worker := func(workerID int) {
+		// Add small delay between worker starts to avoid initial burst
+		time.Sleep(time.Duration(workerID*50) * time.Millisecond)
+
+		for {
+			select {
+			case <-stopCh:
+				return
+			default:
+				service := services[rand.Intn(len(services))]
+				reqPayload := map[string]interface{}{
+					"service": service,
+					"limit":   workloadLimit,
+				}
+				reqBody, _ := json.Marshal(reqPayload)
+				start := time.Now()
+				req, err := http.NewRequestWithContext(ctx, "POST", queryAddr, bytes.NewReader(reqBody))
+				if err != nil {
+					results <- LoadTestResult{0, err}
+					continue
+				}
+				req.Header.Set("Content-Type", "application/json")
+				resp, err := client.Do(req)
+				latency := time.Since(start)
+				if err != nil {
+					results <- LoadTestResult{latency, err}
+					continue
+				}
+				if resp.StatusCode != http.StatusOK {
+					results <- LoadTestResult{latency, fmt.Errorf("status %d", resp.StatusCode)}
+				} else {
+					results <- LoadTestResult{latency, nil}
+				}
+				resp.Body.Close()
+
+				// Add small delay between requests to avoid overwhelming the server
+				time.Sleep(1 * time.Millisecond)
+			}
+		}
+	}
+
+	// Start workers with staggered start times
+	for i := 0; i < concurrency; i++ {
+		go worker(i)
+	}
+
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+	startTime := time.Now()
+	// var lastTotal int64
+	// var lastErrors int64
+	// var lastLatency int64
+	var infinite bool = durationSec == 0
+	var done bool
+	for !done {
+		select {
+		case <-ctx.Done():
+			close(stopCh)
+			done = true
+		case r := <-results:
+			total++
+			totalLatency += int64(r.latency)
+			if r.err != nil {
+				errors++
+			}
+		case <-ticker.C:
+			elapsed := time.Since(startTime).Seconds()
+			//ops := total - lastTotal
+			//errCount := errors - lastErrors
+			//lat := totalLatency - lastLatency
+			//avgLat := float64(0)
+			// if ops > 0 {
+			// 	avgLat = float64(lat) / float64(ops) / 1e6 // ms
+			// }
+			//log.Printf("[%.1fs] QPS: %d, Errors: %d, Avg Latency: %.2fms", elapsed, ops, errCount, avgLat)
+			// lastTotal = total
+			// lastErrors = errors
+			// lastLatency = totalLatency
+			if !infinite && elapsed >= float64(durationSec) {
+				close(stopCh)
+				done = true
+			}
+		}
+	}
+	// Drain remaining results
+	close(results)
+	for r := range results {
+		total++
+		totalLatency += int64(r.latency)
+		if r.err != nil {
+			errors++
+		}
+	}
+	elapsed := time.Since(startTime).Seconds()
+	avgLat := float64(0)
+	if total > 0 {
+		avgLat = float64(totalLatency) / float64(total) / 1e6 // ms
+	}
+	log.Printf("Query load test finished: Total queries: %d, Errors: %d, Duration: %.1fs, QPS: %.2f, Avg Latency: %.2fms", total, errors, elapsed, float64(total)/elapsed, avgLat)
+}
+
+// --- Validation Load Test ---
+func runValidationLoadTest(ctx context.Context, schemaRegistryURL string, concurrency, durationSec int, format, typeName string) {
+	results := make(chan LoadTestResult, 1000)
+	stopCh := make(chan struct{})
+
+	log.Printf("Starting validation load test: %d workers, duration: %ds (0=infinite), format: %s, type: %s",
+		concurrency, durationSec, format, typeName)
+
+	// Start workers
+	for i := 0; i < concurrency; i++ {
+		go validationWorker(ctx, i, schemaRegistryURL, format, typeName, stopCh, results)
+	}
+
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+	startTime := time.Now()
+
+	var total, errors int64
+	var totalLatency int64
+	var infinite bool = durationSec == 0
+	var done bool
+
+	for !done {
+		select {
+		case <-ctx.Done():
+			close(stopCh)
+			done = true
+		case r := <-results:
+			total++
+			totalLatency += int64(r.latency)
+			if r.err != nil {
+				errors++
+			}
+		case <-ticker.C:
+			elapsed := time.Since(startTime).Seconds()
+			if !infinite && elapsed >= float64(durationSec) {
+				close(stopCh)
+				done = true
+			}
+		}
+	}
+
+	// Drain remaining results
+	close(results)
+	for r := range results {
+		total++
+		totalLatency += int64(r.latency)
+		if r.err != nil {
+			errors++
+		}
+	}
+
+	elapsed := time.Since(startTime).Seconds()
+	avgLat := float64(0)
+	if total > 0 {
+		avgLat = float64(totalLatency) / float64(total) / 1e6 // ms
+	}
+	successRate := float64(total-errors) / float64(total) * 100
+	log.Printf("Validation load test complete: %.1fs, Total: %d, Errors: %d (%.1f%% success), Avg Latency: %.2fms",
+		elapsed, total, errors, successRate, avgLat)
+}
+
+func validationWorker(ctx context.Context, workerID int, schemaRegistryURL, format, typeName string, stopCh chan struct{}, results chan LoadTestResult) {
+	// Use connection pooling and longer timeout
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			MaxIdleConns:        100,
+			MaxIdleConnsPerHost: 10,
+			IdleConnTimeout:     90 * time.Second,
+		},
+	}
+
+	// Add small delay between worker starts to avoid initial burst
+	time.Sleep(time.Duration(workerID*50) * time.Millisecond)
+
+	for {
+		select {
+		case <-stopCh:
+			return
+		default:
+			// Generate random log entry for validation
+			entry := randomLog()
+
+			validateRequest := map[string]interface{}{
+				"format": format,
+				"name":   typeName,
+				"data":   entry,
+			}
+
+			reqBody, _ := json.Marshal(validateRequest)
+			start := time.Now()
+
+			req, err := http.NewRequestWithContext(ctx, "POST", schemaRegistryURL+"/schema/validate", bytes.NewReader(reqBody))
+			if err != nil {
+				results <- LoadTestResult{0, err}
+				continue
+			}
+
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := client.Do(req)
+			latency := time.Since(start)
+
+			if err != nil {
+				results <- LoadTestResult{latency, err}
+				continue
+			}
+
+			if resp.StatusCode != http.StatusOK {
+				results <- LoadTestResult{latency, fmt.Errorf("validation failed: status %d", resp.StatusCode)}
+			} else {
+				results <- LoadTestResult{latency, nil}
+			}
+			resp.Body.Close()
+
+			// Add small delay between requests to avoid overwhelming the server
+			time.Sleep(1 * time.Millisecond)
+		}
+	}
 }

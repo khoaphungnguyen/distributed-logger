@@ -243,6 +243,8 @@ var (
 	droppedLogs  int64
 	rateTicker   = time.NewTicker(1 * time.Second)
 
+	lastLogsPerSec int64 // stores the last calculated logs/sec
+
 	partitionBuffers = make(map[string]chan LogEntry)
 	bufferMu         sync.Mutex
 )
@@ -299,20 +301,21 @@ func writeLogBatchBuffered(entries []LogEntry) {
 func metricsLogger() {
 	for range rateTicker.C {
 		rate := atomic.LoadInt64(&processCount)
-		bytesPerSec := atomic.LoadInt64(&totalBytes)
-		totalLat := atomic.LoadInt64(&totalLatency)
-		latCount := atomic.LoadInt64(&latencyCount)
-		dropped := atomic.LoadInt64(&droppedLogs)
+		// bytesPerSec := atomic.LoadInt64(&totalBytes)
+		// totalLat := atomic.LoadInt64(&totalLatency)
+		// latCount := atomic.LoadInt64(&latencyCount)
+		// dropped := atomic.LoadInt64(&droppedLogs)
 
-		avgLatency := float64(0)
-		if latCount > 0 {
-			avgLatency = float64(totalLat) / float64(latCount)
-		}
-		numGoroutines := runtime.NumGoroutine()
+		// avgLatency := float64(0)
+		// if latCount > 0 {
+		// 	avgLatency = float64(totalLat) / float64(latCount)
+		// }
+		// numGoroutines := runtime.NumGoroutine()
 
-		log.Printf("[METRIC] Logs/sec: %d, MB/s: %.2f, Latency: %.2fµs, Goroutines: %d, Dropped: %d",
-			rate, float64(bytesPerSec)/(1024*1024), avgLatency, numGoroutines, dropped)
+		// log.Printf("[METRIC] Logs/sec: %d, MB/s: %.2f, Latency: %.2fµs, Goroutines: %d, Dropped: %d",
+		// 	rate, float64(bytesPerSec)/(1024*1024), avgLatency, numGoroutines, dropped)
 
+		atomic.StoreInt64(&lastLogsPerSec, rate)
 		atomic.StoreInt64(&processCount, 0)
 		atomic.StoreInt64(&totalBytes, 0)
 		atomic.StoreInt64(&totalLatency, 0)
@@ -701,11 +704,17 @@ func getResourceMetrics() map[string]interface{} {
 }
 
 func storageMetricsHandler(w http.ResponseWriter, r *http.Request) {
+	latCount := atomic.LoadInt64(&latencyCount)
+	totalLat := atomic.LoadInt64(&totalLatency)
+	avgLatency := float64(0)
+	if latCount > 0 {
+		avgLatency = float64(totalLat) / float64(latCount)
+	}
 	metrics := map[string]interface{}{
 		"service_type": "storage",
 		"service_id":   selfAddr,
-		"logs_per_sec": atomic.LoadInt64(&processCount),
-		"mb_per_sec":   float64(atomic.LoadInt64(&totalBytes)) / (1024 * 1024),
+		"logs_per_sec": atomic.LoadInt64(&lastLogsPerSec),
+		"latency_us":   avgLatency,
 		"dropped":      atomic.LoadInt64(&droppedLogs),
 		"resource":     getResourceMetrics(),
 	}
@@ -719,7 +728,7 @@ func main() {
 	go compressOldFiles(3)
 	go periodicallyUpdateStorageNodes()
 	go readRepairEngine()
-	// go metricsLogger()
+	go metricsLogger() // Enable metricsLogger to update logs_per_sec
 	http.HandleFunc("/ingest/batch", batchLogHandler)
 	http.HandleFunc("/query", queryHandler)
 	http.HandleFunc("/cluster/health", healthHandler)

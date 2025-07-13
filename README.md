@@ -364,10 +364,11 @@ Compressed log files are written to:
 
 ### 🚀 Day 21 Milestones: Unified Metrics Aggregator & Dashboard
 
-- 📊 **Metrics Aggregator Service:** Introduced a dedicated metrics-aggregator microservice that periodically scrapes metrics from all cluster services (ingestor, storage, query, schema, and cluster-manager).
-- 🖥️ **Unified Cluster Dashboard:** Added a modern, responsive web dashboard that visualizes real-time health, throughput, latency, and error rates for every node and service in the cluster.
-- 🔄 **Live Metrics Collection:** Aggregator collects and normalizes metrics (logs/sec, MB/sec, latency, errors, resource usage, etc.) from all nodes, providing a single source of truth for operational visibility.
-- 🟢 **Health & Status Overview:** Dashboard displays cluster-wide stats, node health, and highlights any bad or unreachable nodes for rapid troubleshooting.
-- 📈 **Consistent Metrics Format:** All services now expose unified `/metrics` endpoints with standardized fields, making it easy to compare and visualize performance across the stack.
-- 🚦 **Auto-Refresh & Drilldown:** Dashboard auto-refreshes every few seconds and allows users to drill down into individual node stats for detailed inspection.
-- ⚡ **Production-Ready Monitoring:** This milestone delivers a single-pane-of-glass view for operators, enabling proactive monitoring, alerting, and capacity planning for distributed log workloads.
+📊 **Metrics Aggregator Service:** Introduced a dedicated metrics-aggregator microservice that periodically scrapes metrics from all cluster services (ingestor, storage, query, schema, and cluster-manager).
+🖥️ **Unified Cluster Dashboard:** Added a modern, responsive web dashboard that visualizes real-time health, throughput, latency, and error rates for every node and service in the cluster.
+🔄 **Live Metrics Collection:** Aggregator collects and normalizes metrics (logs/sec, MB/sec, latency, errors, resource usage, etc.) from all nodes, providing a single source of truth for operational visibility.
+📊 **Unified Op/s, Latency, and Error Monitoring:** The dashboard now displays operations per second (op/s), average latency, and error counts for every service (ingestor, storage, query, schema, and cluster-manager) in real time. This enables comprehensive monitoring of all logs and validation activity from a single unified dashboard powered by the metrics aggregator.
+🟢 **Health & Status Overview:** Dashboard displays cluster-wide stats, node health, and highlights any bad or unreachable nodes for rapid troubleshooting.
+📈 **Consistent Metrics Format:** All services now expose unified `/metrics` endpoints with standardized fields, making it easy to compare and visualize performance across the stack.
+🚦 **Auto-Refresh & Drilldown:** Dashboard auto-refreshes every few seconds and allows users to drill down into individual node stats for detailed inspection.
+⚡ **Production-Ready Monitoring:** This milestone delivers a single-pane-of-glass view for operators, enabling proactive monitoring, alerting, and capacity planning for distributed log workloads.

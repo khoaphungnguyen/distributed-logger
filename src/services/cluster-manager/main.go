@@ -120,6 +120,22 @@ func schemaServiceHandler(w http.ResponseWriter, r *http.Request) {
 	http.Error(w, "no healthy schema service found", 404)
 }
 
+// --- Expose healthy query service address ---
+func queryServiceHandler(w http.ResponseWriter, r *http.Request) {
+	nodesMutex.Lock()
+	defer nodesMutex.Unlock()
+	for _, n := range nodes {
+		if n.Type == "query" && n.IsHealthy {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]string{
+				"address": n.Address,
+			})
+			return
+		}
+	}
+	http.Error(w, "no healthy query service found", 404)
+}
+
 // --- Register a node (requires address and type) ---
 func registerHandler(w http.ResponseWriter, r *http.Request) {
 	var req Node
@@ -288,6 +304,7 @@ func main() {
 	http.HandleFunc("/metrics", metricsHandler)
 	http.HandleFunc("/cluster/health", healthHandler)
 	http.HandleFunc("/schema-service", schemaServiceHandler)
+	http.HandleFunc("/query-service", queryServiceHandler)
 	go healthCheckNodes()
 	addr := os.Getenv("CLUSTER_MANAGER_ADDR")
 	if addr == "" {
