@@ -1,4 +1,22 @@
 services:
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: rabbitmq
+    ports:
+      - "5672:5672"    # AMQP protocol port
+      - "15672:15672"  # Management UI port
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+
+  rabbitmq-client:
+    build:
+      context: ./src/services/rabbitmq
+    environment:
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
+    depends_on:
+      - rabbitmq
+
   cluster-manager:
     build:
       context: ./src/services/cluster-manager
@@ -10,6 +28,7 @@ services:
       - CLUSTER_MANAGER_ADDR=http://cluster-manager:5000
     depends_on:
       - cluster-manager
+ 
 
   storage-1:
     build:
@@ -27,13 +46,13 @@ services:
     depends_on:
       - cluster-manager
 
-  storage-3:
-    build:
-      context: ./src/services/storage
-    environment:
-      - CLUSTER_MANAGER_ADDR=http://cluster-manager:5000
-    depends_on:
-      - cluster-manager
+  # storage-3:
+  #   build:
+  #     context: ./src/services/storage
+  #   environment:
+  #     - CLUSTER_MANAGER_ADDR=http://cluster-manager:5000
+  #   depends_on:
+  #     - cluster-manager
 
   ingestor-1:
     build:
@@ -45,19 +64,18 @@ services:
       - cluster-manager
       - storage-1
       - storage-2
-      - storage-3
 
-  ingestor-2:
-    build:
-      context: ./src/services/ingestor
-    environment:
-      - CLUSTER_MANAGER_ADDR=http://cluster-manager:5000
-      - APP_VERSION=Ingestor 1.22.0
-    depends_on:
-      - cluster-manager
-      - storage-1
-      - storage-2
-      - storage-3
+  # ingestor-2:
+  #   build:
+  #     context: ./src/services/ingestor
+  #   environment:
+  #     - CLUSTER_MANAGER_ADDR=http://cluster-manager:5000
+  #     - APP_VERSION=Ingestor 1.22.0
+  #   depends_on:
+  #     - cluster-manager
+  #     - storage-1
+  #     - storage-2
+  #     - storage-3
 
   query:
     build:
@@ -70,15 +88,6 @@ services:
       - cluster-manager
       - storage-1
       - storage-2
-      - storage-3
-    deploy:
-      resources:
-        limits:
-          cpus: "2.0"
-          memory: 1G
-        reservations:
-          cpus: "0.5"
-          memory: 256M
 
   metrics-aggregator:
     build:
@@ -90,10 +99,8 @@ services:
     depends_on:
       - cluster-manager
       - ingestor-1
-      - ingestor-2
       - storage-1
       - storage-2
-      - storage-3
 
   client-1:
     build:
@@ -105,44 +112,34 @@ services:
     depends_on:
       - cluster-manager
       - ingestor-1
-      - ingestor-2
 
-  client-2:
-    build:
-      context: ./src/services/client
-    command:
-      ["./client", "--batch", "500", "--interval", "10", "--format", "json"]
-    environment:
-      - CLUSTER_MANAGER_ADDR=http://cluster-manager:5000
-    depends_on:
-      - cluster-manager
-      - ingestor-1
-      - ingestor-2
+  # client-query:
+  #   build:
+  #     context: ./src/services/client
+  #   command:
+  #     [
+  #       "./client",
+  #       "--queryload",
+  #       "--queryconcurrency",
+  #       "2",
+  #       "--workloadlimit",
+  #       "100",
+  #     ]
+  #   environment:
+  #     - CLUSTER_MANAGER_ADDR=http://cluster-manager:5000
+  #   depends_on:
+  #     - cluster-manager
+  #     - query
 
-  client-query:
-    build:
-      context: ./src/services/client
-    command:
-      [
-        "./client",
-        "--queryload",
-        "--queryconcurrency",
-        "2",
-        "--workloadlimit",
-        "100",
-      ]
-    environment:
-      - CLUSTER_MANAGER_ADDR=http://cluster-manager:5000
-    depends_on:
-      - cluster-manager
-      - query
+  # client-validation:
+  #   build:
+  #     context: ./src/services/client
+  #   command: ["./client", "--validationload", "--queryconcurrency", "2"]
+  #   environment:
+  #     - CLUSTER_MANAGER_ADDR=http://cluster-manager:5000
+  #   depends_on:
+  #     - cluster-manager
+  #     - schema-validator
+  
 
-  client-validation:
-    build:
-      context: ./src/services/client
-    command: ["./client", "--validationload", "--queryconcurrency", "2"]
-    environment:
-      - CLUSTER_MANAGER_ADDR=http://cluster-manager:5000
-    depends_on:
-      - cluster-manager
-      - schema-validator
+    
