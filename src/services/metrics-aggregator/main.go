@@ -102,6 +102,11 @@ func metricsScraperLoop() {
 			time.Sleep(scrapeInterval)
 			continue
 		}
+		// Build a set of current node addresses
+		currentAddrs := make(map[string]struct{})
+		for _, node := range nodes {
+			currentAddrs[node.Address] = struct{}{}
+		}
 		var wg sync.WaitGroup
 		for _, node := range nodes {
 			if !node.IsHealthy {
@@ -122,6 +127,14 @@ func metricsScraperLoop() {
 			}(node)
 		}
 		wg.Wait()
+		// Purge nodeMetrics entries for addresses not in currentAddrs
+		nodesMu.Lock()
+		for addr := range nodeMetrics {
+			if _, ok := currentAddrs[addr]; !ok {
+				delete(nodeMetrics, addr)
+			}
+		}
+		nodesMu.Unlock()
 		time.Sleep(scrapeInterval)
 	}
 }
@@ -131,10 +144,33 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 	clusterStatsMu.RLock()
 	defer nodesMu.RUnlock()
 	defer clusterStatsMu.RUnlock()
+
+	// Deduplicate nodeMetrics by (hostname, type), keep the one with the highest port (assume newest)
+	filtered := make(map[string]*NodeMetrics)
+	for _, nm := range nodeMetrics {
+		node := nm.Node
+		metrics := nm.Metrics
+		// Try to get port from address
+		hostKey := ""
+		if metrics != nil {
+			if res, ok := metrics["resource"].(map[string]interface{}); ok {
+				if h, ok := res["hostname"].(string); ok {
+					hostKey = h + ":" + node.Type
+				}
+			}
+		}
+		if hostKey == "" {
+			// fallback to address
+			hostKey = node.Address + ":" + node.Type
+		}
+		// Always keep the last one seen (newest scrape)
+		filtered[hostKey] = nm
+	}
+
 	result := map[string]interface{}{
 		"cluster_stats": clusterStats,
 		"bad_nodes":     badNodes,
-		"node_metrics":  nodeMetrics,
+		"node_metrics":  filtered,
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(result)

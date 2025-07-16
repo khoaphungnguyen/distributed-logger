@@ -1,6 +1,7 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
   <head>
+    <meta charset="UTF-8">
     <title>Logger Cluster Dashboard</title>
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <link
@@ -114,6 +115,7 @@
         transition: all 0.4s cubic-bezier(0.4, 0, 0.2, 1);
         position: relative;
         overflow: hidden;
+        -webkit-backdrop-filter: blur(10px);
         backdrop-filter: blur(10px);
       }
 
@@ -219,6 +221,7 @@
         padding: 16px 24px;
         background: rgba(255, 255, 255, 0.8);
         border-radius: 12px;
+        -webkit-backdrop-filter: blur(10px);
         backdrop-filter: blur(10px);
         box-shadow: 0 4px 16px rgba(0, 0, 0, 0.05);
       }
@@ -260,6 +263,7 @@
         padding: 24px;
         margin: 24px 0;
         box-shadow: 0 8px 32px rgba(0, 0, 0, 0.08);
+        -webkit-backdrop-filter: blur(10px);
         backdrop-filter: blur(10px);
         border: 1px solid rgba(255, 255, 255, 0.2);
       }
@@ -268,8 +272,7 @@
         overflow-x: auto;
         margin: -16px;
         padding: 16px;
-        scrollbar-width: thin;
-        scrollbar-color: var(--primary-color) var(--background-primary);
+        /* Removed unsupported scrollbar-width and scrollbar-color for better compatibility */
       }
 
       .table-container::-webkit-scrollbar {
@@ -948,7 +951,7 @@
   </head>
   <body>
     <div class="dashboard-header">
-      <h1><i class="material-icons" style="vertical-align: middle; margin-right: 8px; font-size: 1.5rem;">analytics</i>Distributed Logger Dashboard</h1>
+      <h1><i class="material-icons dashboard-icon">analytics</i>Distributed Logger Dashboard</h1>
     </div>
     
     <div class="summary-section">
@@ -1028,7 +1031,7 @@
     <div class="container">
       <div class="refresh-controls">
         <div class="last-refresh">
-          <i class="material-icons" style="vertical-align: middle; margin-right: 4px; font-size: 18px;">schedule</i>
+          <i class="material-icons dashboard-icon-small">schedule</i>
           Last updated: <span id="last-refresh">Never</span>
         </div>
         <a class="btn waves-effect waves-light refresh-btn" onclick="refresh()">
@@ -1110,6 +1113,9 @@
         fetch("/metrics")
           .then((r) => r.json())
           .then((data) => {
+            // Clear the table body before rendering new rows to remove stale data
+            const tableBody = document.querySelector("#nodes-table tbody");
+            if (tableBody) tableBody.innerHTML = "";
             // Update cluster state summary with animations
             const healthy = data.cluster_stats.healthy_nodes || {};
             updateCountWithAnimation("ingestor-count", healthy.ingestor || 0);
@@ -1124,10 +1130,10 @@
             
             document.getElementById("last-refresh").textContent = new Date().toLocaleTimeString();
 
-            // Build node rows
+            // Build node rows, only show nodes present in the latest metrics
             let rows = [];
             let idx = 0;
-            
+
             // Add cluster manager
             let cm = data.cluster_stats || {};
             if (cm.resource) {
@@ -1143,13 +1149,14 @@
               });
               idx++;
             }
-            
-            // Add other nodes
+
+            // Add other nodes (only those present in node_metrics)
             for (const [addr, nm] of Object.entries(data.node_metrics || {})) {
+              // Only show healthy or recently updated nodes (backend should remove stale nodes)
               rows.push({ ...nm, __idx: idx });
               idx++;
             }
-            
+
             // Sort by type: cluster-manager first, then others alphabetically
             rows.sort((a, b) => {
               const typeA = a.Node.type || "";
@@ -1159,46 +1166,49 @@
               return typeA.localeCompare(typeB);
             });
 
-            // Build table HTML
+            // Only one leader badge: find the current leader hostname and only mark that node
+            let leaderAssigned = false;
             let tbody = "";
             rows.forEach((nm, i) => {
               const m = nm.Metrics || {};
               const res = m.resource || {};
               const node = nm.Node || {};
               const isHealthy = node.is_healthy;
-              
+
               // Status icon
               const statusClass = isHealthy ? "healthy" : "error";
               const statusIcon = `<div class="status-icon ${statusClass}"></div>`;
-              
+
               // Format hostname
               const hostname = res.hostname || (node.address || "").split("://")[1]?.split(":")[0] || node.address;
               const hostCell = `<span class="host-cell">${hostname}</span>`;
-              
-              // Type cell with leader badge
-              const isLeader = node.type === "ingestor" && hostname === leaderHostname;
-              const typeCell = `<span class="type-cell">${niceType(node.type)}</span>` +
-                (isLeader ? '<span class="leader-badge">Leader</span>' : '');
-              
+
+              // Only one leader badge for the current leader
+              let typeCell = `<span class="type-cell">${niceType(node.type)}</span>`;
+              if (!leaderAssigned && node.type === "ingestor" && hostname === leaderHostname) {
+                typeCell += '<span class="leader-badge">Leader</span>';
+                leaderAssigned = true;
+              }
+
               // Metrics
               const goroutines = res.goroutines || "-";
               const memSys = res.mem_sys ? toMB(res.mem_sys) : "-";
-              
+
               const opsPerSec = getOpsPerSecond(node.type, m);
               const latency = getLatency(node.type, m);
               const errors = getErrors(node.type, m);
-              
+
               // Format operations per second - show actual values, not cumulative
-              const opsCell = opsPerSec !== null ? 
-                `<span class="metric-value">${opsPerSec}</span>` : 
+              const opsCell = opsPerSec !== null ?
+                `<span class="metric-value">${opsPerSec}</span>` :
                 `<span class="no-ops">-</span>`;
-              
-              const latencyCell = latency !== null ? 
-                `<span class="metric-value">${Math.round(latency)}</span>` : 
+
+              const latencyCell = latency !== null ?
+                `<span class="metric-value">${Math.round(latency)}</span>` :
                 `<span class="no-ops">-</span>`;
-              
-              const errorsCell = errors !== null ? 
-                `<span class="metric-value">${errors}</span>` : 
+
+              const errorsCell = errors !== null ?
+                `<span class="metric-value">${errors}</span>` :
                 `<span class="no-ops">-</span>`;
 
               tbody += `<tr>
